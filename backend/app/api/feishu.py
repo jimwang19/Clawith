@@ -235,8 +235,9 @@ async def feishu_event_webhook(
             import uuid as _uuid
             feishu_user_uuid = _uuid.uuid5(_uuid.NAMESPACE_URL, f"feishu:{sender_open_id}")
 
-            # Save user message with Feishu user's UUID (not creator_id)
-            db.add(ChatMessage(agent_id=agent_id, user_id=feishu_user_uuid, role="user", content=user_text, conversation_id=conv_id))
+            # Save user message using agent creator's ID (FK constraint requires valid users.id)
+            # The Feishu sender is tracked via conversation_id (feishu_p2p_{open_id})
+            db.add(ChatMessage(agent_id=agent_id, user_id=creator_id, role="user", content=user_text, conversation_id=conv_id))
             await db.commit()
 
             # Resolve sender identity via Feishu API (using the bot's own credentials)
