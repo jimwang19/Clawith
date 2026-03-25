@@ -352,14 +352,21 @@ AGENTBAY_API_URL = "https://api.agentbay.ai/v1"
 
 
 async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Optional[str]:
-    """Return the configured AgentBay API key for the given agent."""
+    """Return the configured AgentBay API key for the given agent.
+
+    Resolution order:
+    1. Per-agent ChannelConfig (channel_type='agentbay') — set via Agent detail page
+    2. Global Tool.config.api_key (category='agentbay') — set via Company Settings
+    """
     from app.models.channel_config import ChannelConfig
+    from app.models.tool import Tool
     from sqlalchemy import select
     from app.database import async_session
     from app.core.security import decrypt_data
     from app.config import get_settings
 
     async def _fetch(session):
+        # 1) Check per-agent ChannelConfig first (highest priority)
         result = await session.execute(
             select(ChannelConfig).where(
                 ChannelConfig.agent_id == agent_id,
@@ -368,14 +375,30 @@ async def get_agentbay_api_key_for_agent(agent_id: uuid.UUID, db=None) -> Option
             )
         )
         config = result.scalar_one_or_none()
-        if not config or not config.app_secret:
-            return None
-        
-        # Try to decrypt, fallback to plaintext if it fails
-        try:
-            return decrypt_data(config.app_secret, get_settings().SECRET_KEY)
-        except Exception:
-            return config.app_secret
+        if config and config.app_secret:
+            # Try to decrypt, fallback to plaintext if it fails
+            try:
+                return decrypt_data(config.app_secret, get_settings().SECRET_KEY)
+            except Exception:
+                return config.app_secret
+
+        # 2) Fallback: check global Tool.config.api_key for any agentbay tool
+        tool_result = await session.execute(
+            select(Tool).where(
+                Tool.category == "agentbay",
+                Tool.enabled == True,
+            ).limit(1)
+        )
+        tool = tool_result.scalar_one_or_none()
+        if tool and tool.config and tool.config.get("api_key"):
+            api_key = tool.config["api_key"]
+            # Try to decrypt (global config is encrypted via _encrypt_sensitive_fields)
+            try:
+                return decrypt_data(api_key, get_settings().SECRET_KEY)
+            except Exception:
+                return api_key
+
+        return None
 
     if db:
         return await _fetch(db)
