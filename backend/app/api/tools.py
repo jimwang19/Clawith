@@ -55,12 +55,17 @@ async def list_tools(
     db: AsyncSession = Depends(get_db),
 ):
     """List platform tools scoped by tenant (builtin + tenant-specific)."""
-    from sqlalchemy import or_ as _or
+    from sqlalchemy import or_ as _or, and_ as _and
     # Exclude tools that were installed by agents via import_mcp_server
     agent_installed_tids = select(AgentTool.tool_id).where(AgentTool.source == "user_installed")
+    # Also exclude orphaned MCP tools (no AgentTool records, no tenant_id)
+    # These can appear when admin deletes agent-tool assignments but Tool records remain
+    all_assigned_tids = select(AgentTool.tool_id).distinct()
+    orphaned_mcp = _and(Tool.type == "mcp", Tool.tenant_id == None, ~Tool.id.in_(all_assigned_tids))
     query = (
         select(Tool)
         .where(~Tool.id.in_(agent_installed_tids))
+        .where(~orphaned_mcp)
         .order_by(Tool.category, Tool.name)
     )
     # Scope by tenant: show builtin (tenant_id is NULL) + tenant-specific tools
