@@ -1330,35 +1330,12 @@ export default function EnterpriseSettings() {
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.model')}</label>
-                                        <div style={{ display: 'flex', gap: '8px' }}>
-                                            <select 
-                                                className="form-input" 
-                                                value={(!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') ? 'custom' : modelForm.model} 
-                                                onChange={e => {
-                                                    if (e.target.value === 'custom') {
-                                                        setModelForm({ ...modelForm, model: '' });
-                                                    } else {
-                                                        setModelForm({ ...modelForm, model: e.target.value });
-                                                    }
-                                                }}
-                                                style={{ flex: (!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') ? '1' : '100%' }}
-                                            >
-                                                <option value="" disabled>Select a model</option>
-                                                {(PRESET_MODELS[modelForm.provider] || []).map(m => (
-                                                    <option key={m} value={m}>{m}</option>
-                                                ))}
-                                                <option value="custom">Custom (Type manually)</option>
-                                            </select>
-                                            {(!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') && (
-                                                <input 
-                                                    className="form-input" 
-                                                    placeholder="Type model name" 
-                                                    value={modelForm.model} 
-                                                    onChange={e => setModelForm({ ...modelForm, model: e.target.value })} 
-                                                    style={{ flex: '2' }}
-                                                />
-                                            )}
-                                        </div>
+                                        <input 
+                                            className="form-input" 
+                                            placeholder={t('enterprise.llm.modelPlaceholder', 'e.g. claude-sonnet-4-20250514')}
+                                            value={modelForm.model} 
+                                            onChange={e => setModelForm({ ...modelForm, model: e.target.value })} 
+                                        />
                                     </div>
                                     <div className="form-group">
                                         <label className="form-label">{t('enterprise.llm.label')}</label>
@@ -1456,35 +1433,12 @@ export default function EnterpriseSettings() {
                                                 </div>
                                                 <div className="form-group">
                                                     <label className="form-label">{t('enterprise.llm.model')}</label>
-                                                    <div style={{ display: 'flex', gap: '8px' }}>
-                                                        <select 
-                                                            className="form-input" 
-                                                            value={(!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') ? 'custom' : modelForm.model} 
-                                                            onChange={e => {
-                                                                if (e.target.value === 'custom') {
-                                                                    setModelForm({ ...modelForm, model: '' });
-                                                                } else {
-                                                                    setModelForm({ ...modelForm, model: e.target.value });
-                                                                }
-                                                            }}
-                                                            style={{ flex: (!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') ? '1' : '100%' }}
-                                                        >
-                                                            <option value="" disabled>Select a model</option>
-                                                            {(PRESET_MODELS[modelForm.provider] || []).map(m => (
-                                                                <option key={m} value={m}>{m}</option>
-                                                            ))}
-                                                            <option value="custom">Custom (Type manually)</option>
-                                                        </select>
-                                                        {(!PRESET_MODELS[modelForm.provider]?.includes(modelForm.model) && modelForm.model !== '') && (
-                                                            <input 
-                                                                className="form-input" 
-                                                                placeholder="Type model name" 
-                                                                value={modelForm.model} 
-                                                                onChange={e => setModelForm({ ...modelForm, model: e.target.value })} 
-                                                                style={{ flex: '2' }}
-                                                            />
-                                                        )}
-                                                    </div>
+                                                    <input 
+                                                        className="form-input" 
+                                                        placeholder={t('enterprise.llm.modelPlaceholder', 'e.g. claude-sonnet-4-20250514')}
+                                                        value={modelForm.model} 
+                                                        onChange={e => setModelForm({ ...modelForm, model: e.target.value })} 
+                                                    />
                                                 </div>
                                                 <div className="form-group">
                                                     <label className="form-label">{t('enterprise.llm.label')}</label>
