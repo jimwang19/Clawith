@@ -170,7 +170,8 @@ class DiscordGatewayManager:
                 if not agent_obj:
                     return "Agent not found."
                 creator_id = agent_obj.creator_id
-                ctx_size = agent_obj.context_window_size or 20
+                from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
+                ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
 
                 # Find or create platform user for this Discord sender via unified service
                 from app.services.channel_user_service import channel_user_service

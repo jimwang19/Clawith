@@ -435,7 +435,8 @@ async def teams_event_webhook(
         # Load agent (must happen before user resolution for tenant_id)
         agent_r = await db.execute(select(AgentModel).where(AgentModel.id == agent_id))
         agent_obj = agent_r.scalar_one_or_none()
-        ctx_size = agent_obj.context_window_size if agent_obj else 20
+        from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
+        ctx_size = agent_obj.context_window_size if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
         # Find-or-create platform user for this Teams sender via unified service
         from app.services.channel_user_service import channel_user_service

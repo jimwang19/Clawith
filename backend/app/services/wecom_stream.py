@@ -289,7 +289,8 @@ async def _process_wecom_stream_message(
         if not agent_obj:
             logger.warning(f"[WeCom Stream] Agent {agent_id} not found")
             return "Agent not found"
-        ctx_size = agent_obj.context_window_size or 20
+        from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
+        ctx_size = agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE
 
         # Conversation ID: differentiate single chat vs group chat
         # Group detection is based on chatid presence, not chattype (SDK bug)
