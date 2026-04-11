@@ -98,6 +98,7 @@ class DingTalkStreamManager:
                         conversation_id = incoming.conversation_id or ""
                         conversation_type = incoming.conversation_type or "1"
                         session_webhook = incoming.session_webhook or ""
+                        conversation_title = getattr(incoming, "conversation_title", "") or ""
 
                         logger.info(
                             f"[DingTalk Stream] Message from [{incoming.sender_nick}]{sender_staff_id}: {user_text[:80]}"
@@ -115,6 +116,7 @@ class DingTalkStreamManager:
                                     conversation_id=conversation_id,
                                     conversation_type=conversation_type,
                                     session_webhook=session_webhook,
+                                    conversation_title=conversation_title,
                                 ),
                                 main_loop,
                             )

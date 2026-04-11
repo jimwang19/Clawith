@@ -59,6 +59,13 @@ async def find_or_create_channel_session(
         if not session.is_group and session.user_id != user_id:
             session.user_id = user_id
 
+        # Auto-correct is_group=False for group sessions (legacy data creation bug)
+        if is_group and not session.is_group:
+            session.is_group = True
+            if group_name:
+                session.group_name = group_name
+                session.title = group_name[:40]
+
         # For group sessions: update group_name if it changed
         if session.is_group and group_name and session.group_name != group_name:
             session.group_name = group_name

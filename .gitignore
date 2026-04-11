@@ -6,6 +6,8 @@ build/
 __pycache__/
 *.pyc
 .env
+config.env
+**/bridge*/logs/
 .venv/
 .vscode/
 .claude/

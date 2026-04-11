@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""
+Clawith Bridge-Claude — 通过 claude_agent_sdk 连接 Claude Code CLI
+
+架构:
+  1. 轮询 Clawith 获取新消息
+  2. 用 claude_agent_sdk.query() 异步流式调用 Claude Code CLI
+  3. 流式推送中间状态（工具调用、回复中...）给 Clawith
+  4. Claude 完成后 report 最终结果给 Clawith
+  5. 如果 Claude 需要权限确认，转发给 Clawith 用户，等待回复后响应
+
+需要: Python 3.10+, claude-agent-sdk, anyio
+"""
+
+import functools
+import json
+import os
+import sys
+import time
+import random
+import logging
+import threading
+import urllib.request
+import urllib.error
+import uuid
+from dataclasses import dataclass, field
+
+try:
+    import claude_agent_sdk
+except ImportError:
+    print("ERROR: claude_agent_sdk not installed. Run: pip install claude-agent-sdk")
+    sys.exit(1)
+
+import anyio
+from claude_agent_sdk import (
+    query as claude_query,
+    ClaudeAgentOptions,
+    HookMatcher,
+    AssistantMessage,
+    TextBlock,
+    ResultMessage,
+    SystemMessage,
+    RateLimitEvent,
+)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("bridge-claude")
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CLAWITH_API_URL          = os.environ.get("CLAWITH_API_URL",          "http://100.123.217.100:8000")
+CLAWITH_API_KEY          = os.environ.get("CLAWITH_API_KEY",          "")
+POLL_INTERVAL            = int(os.environ.get("POLL_INTERVAL",        "5"))
+TASK_TIMEOUT             = int(os.environ.get("TASK_TIMEOUT",     "300"))
+CLAWITH_SEND_ENABLED     = os.environ.get("CLAWITH_SEND_ENABLED",     "0") == "1"
+IDLE_POLL_LOG_EVERY      = int(os.environ.get("IDLE_POLL_LOG_EVERY",  "12"))
+PROGRESS_VIA_REPORT      = os.environ.get("PROGRESS_VIA_REPORT",      "1") == "1"
+INFLIGHT_RECOVER_MAX_AGE = int(os.environ.get("INFLIGHT_RECOVER_MAX_AGE", "900"))
+HTTP_TIMEOUT_SECONDS     = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "10"))
+HTTP_MAX_RETRIES         = int(os.environ.get("HTTP_MAX_RETRIES", "2"))
+HTTP_RETRY_BASE_DELAY    = float(os.environ.get("HTTP_RETRY_BASE_DELAY", "0.7"))
+HTTP_RETRY_MAX_DELAY     = float(os.environ.get("HTTP_RETRY_MAX_DELAY", "5"))
+HTTP_RETRY_JITTER        = float(os.environ.get("HTTP_RETRY_JITTER", "0.25"))
+HTTP_ALERT_CONSEC_FAILS  = int(os.environ.get("HTTP_ALERT_CONSEC_FAILS", "5"))
+
+CLAUDE_WORKDIR_BASE      = os.environ.get("CLAUDE_WORKDIR_BASE",      "/workspaces")
+CLAUDE_MODEL             = os.environ.get("CLAUDE_MODEL",             "")
+CLAUDE_MAX_TURNS         = int(os.environ.get("CLAUDE_MAX_TURNS",     "50"))
+CLAUDE_PERMISSION_MODE   = os.environ.get("CLAUDE_PERMISSION_MODE",   "default")
+CLAUDE_ALLOWED_TOOLS     = os.environ.get("CLAUDE_ALLOWED_TOOLS",     "")
+
+INFLIGHT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "inflight.json")
+_http_fail_streak = 0
+_http_streak_lock = threading.Lock()
+
+
+# ── Short text helper ─────────────────────────────────────────────────────────
+
+def _short_text(text: str, limit: int = 120) -> str:
+    """单行摘要，便于日志追踪。"""
+    s = (text or "").replace("\n", " ").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "..."
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+def _next_retry_delay(attempt: int) -> float:
+    # Exponential backoff with jitter to smooth burst failures on unstable links.
+    base = min(HTTP_RETRY_MAX_DELAY, HTTP_RETRY_BASE_DELAY * (2 ** max(0, attempt - 1)))
+    jitter = random.uniform(0, HTTP_RETRY_JITTER)
+    return min(HTTP_RETRY_MAX_DELAY, base + jitter)
+
+
+def _mark_http_success():
+    global _http_fail_streak
+    with _http_streak_lock:
+        previous = _http_fail_streak
+        _http_fail_streak = 0
+    if previous >= HTTP_ALERT_CONSEC_FAILS:
+        log.warning(f"[net] recovered after {previous} consecutive HTTP failure(s)")
+
+
+def _mark_http_failure(status_hint: str):
+    global _http_fail_streak
+    with _http_streak_lock:
+        _http_fail_streak += 1
+        streak = _http_fail_streak
+    if streak == HTTP_ALERT_CONSEC_FAILS or (
+        HTTP_ALERT_CONSEC_FAILS > 0 and streak > HTTP_ALERT_CONSEC_FAILS and streak % HTTP_ALERT_CONSEC_FAILS == 0
+    ):
+        log.warning(f"[net] {streak} consecutive HTTP failure(s), latest={status_hint}")
+
+
+def _http(method: str, url: str, data=None, headers=None, timeout=None, retries=None):
+    req_headers = {"Content-Type": "application/json"}
+    if headers:
+        req_headers.update(headers)
+    body = json.dumps(data).encode() if data is not None else None
+    timeout = HTTP_TIMEOUT_SECONDS if timeout is None else timeout
+    retries = HTTP_MAX_RETRIES if retries is None else max(0, int(retries))
+
+    for attempt in range(1, retries + 2):
+        req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode()
+                _mark_http_success()
+                return resp.status, json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode()
+            retryable = e.code in {408, 429, 500, 502, 503, 504}
+            if retryable and attempt <= retries:
+                delay = _next_retry_delay(attempt)
+                log.warning(
+                    f"HTTP {e.code} {method} {url} attempt={attempt}/{retries + 1}, retry in {delay:.2f}s: {raw[:120]}"
+                )
+                time.sleep(delay)
+                continue
+            log.error(f"HTTP {e.code} {method} {url}: {raw[:200]}")
+            _mark_http_failure(str(e.code))
+            return e.code, {}
+        except Exception as e:
+            if attempt <= retries:
+                delay = _next_retry_delay(attempt)
+                log.warning(
+                    f"Request failed {method} {url} attempt={attempt}/{retries + 1}, retry in {delay:.2f}s: {e}"
+                )
+                time.sleep(delay)
+                continue
+            log.error(f"Request failed {method} {url}: {e}")
+            _mark_http_failure(type(e).__name__)
+            return 0, {}
+
+    _mark_http_failure("unknown")
+    return 0, {}
+
+
+# ── Clawith API ───────────────────────────────────────────────────────────────
+
+def clawith_poll():
+    status, body = _http("GET", f"{CLAWITH_API_URL}/api/gateway/poll",
+        headers={"X-Api-Key": CLAWITH_API_KEY})
+    if status == 200:
+        return body.get("messages", [])
+    return []
+
+def clawith_report(message_id: str, result: str):
+    message_id = str(message_id or "")
+    # Convert non-UUID message_id to UUID format for Clawith API
+    # Clawith message IDs like "34876783" need to be padded to UUID format
+    if len(message_id) < 36 and "-" not in message_id:
+        # Pad to UUID: 00000000-0000-0000-0000-XXXXXXXXXXXX
+        uuid_id = f"00000000-0000-0000-0000-{message_id.zfill(12)}"
+        log.debug(f"[report] converting {message_id} -> {uuid_id}")
+    else:
+        uuid_id = message_id
+
+    status, body = _http("POST", f"{CLAWITH_API_URL}/api/gateway/report",
+        data={"message_id": uuid_id, "result": result},
+        headers={"X-Api-Key": CLAWITH_API_KEY},
+        retries=1)
+    if status == 200:
+        log.info(f"[report] ok msg={message_id} uuid={uuid_id} text='{_short_text(result, 160)}'")
+        return True
+    elif status == 422:
+        log.error(f"[report] 422 UUID error for {message_id} (tried {uuid_id})")
+        return False
+    else:
+        log.error(f"[report] failed status={status} msg={message_id} text='{_short_text(result, 120)}'")
+        return False
+
+def clawith_send_message(conversation_id: str, content: str):
+    """向 Clawith 对话发送中间状态消息"""
+    if not CLAWITH_SEND_ENABLED:
+        log.info(f"[send] skipped conv={conversation_id[:8]} text='{_short_text(content)}'")
+        return False
+    status, _ = _http("POST", f"{CLAWITH_API_URL}/api/gateway/send",
+        data={"conversation_id": conversation_id, "content": content},
+        headers={"X-Api-Key": CLAWITH_API_KEY},
+        retries=1)
+    if status == 200:
+        log.info(f"[send] conv={conversation_id[:8]} text='{_short_text(content)}'")
+    else:
+        log.warning(f"[send] failed status={status} conv={conversation_id[:8]} text='{_short_text(content)}'")
+    return status == 200
+
+def clawith_heartbeat():
+    _http("POST", f"{CLAWITH_API_URL}/api/gateway/heartbeat",
+        headers={"X-Api-Key": CLAWITH_API_KEY})
+
+
+# ── Inflight task persistence ─────────────────────────────────────────────────
+
+_inflight_lock = threading.Lock()
+
+def _load_inflight() -> dict:
+    try:
+        with open(INFLIGHT_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_inflight(data: dict):
+    tmp = INFLIGHT_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, INFLIGHT_FILE)
+    except Exception as e:
+        log.warning(f"[inflight] save failed: {e}")
+
+def inflight_add(msg_id: str, content: str, conv_id: str):
+    with _inflight_lock:
+        data = _load_inflight()
+        data[str(msg_id)] = {"content": content[:200], "conv_id": str(conv_id), "ts": time.time()}
+        _save_inflight(data)
+
+def inflight_remove(msg_id: str):
+    with _inflight_lock:
+        data = _load_inflight()
+        if str(msg_id) in data:
+            del data[str(msg_id)]
+            _save_inflight(data)
+
+def recover_inflight():
+    """启动时：对上次中断的 in-flight 任务回报中断信息，让 Clawith 侧感知到 bridge 重启。"""
+    with _inflight_lock:
+        data = _load_inflight()
+    if not data:
+        return
+    now = time.time()
+    recent = {
+        msg_id: info
+        for msg_id, info in data.items()
+        if now - float(info.get("ts", 0) or 0) <= INFLIGHT_RECOVER_MAX_AGE
+    }
+    stale_count = len(data) - len(recent)
+    if stale_count:
+        log.warning(f"[startup] skip {stale_count} stale inflight task(s)")
+    if not recent:
+        with _inflight_lock:
+            _save_inflight({})
+        return
+
+    log.warning(f"[startup] found {len(recent)} recent inflight task(s), reporting interruption")
+    for msg_id, info in recent.items():
+        preview = info.get("content", "")[:60].replace("\n", " ")
+        clawith_report(
+            msg_id,
+            f"⚠️ Bridge 重启，任务中断（上次任务：{preview}）。请重新发送消息。"
+        )
+    with _inflight_lock:
+        _save_inflight({})
+    log.info(f"[startup] cleared {len(data)} inflight task(s)")
+
+
+# ── Session management ────────────────────────────────────────────────────────
+
+# conv_id -> claude_session_id (populated at runtime from SystemMessage init)
+_sessions: dict[str, str] = {}
+
+def get_workdir(conv_id: str) -> str:
+    return os.path.join(CLAUDE_WORKDIR_BASE, str(conv_id))
+
+
+# ── TaskState ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class TaskState:
+    clawith_msg_id: str
+    conv_id: str
+    claude_session_id: str          # may be empty initially
+    request_preview: str
+    sender_is_agent: bool
+    reported: bool = False
+    start_time: float = field(default_factory=time.time)
+    last_status_push: float = 0.0
+    last_progress_text: str = ""
+    pending_permission: threading.Event = field(default_factory=threading.Event)
+    permission_decision: str = "deny"
+    tool_calls: list = field(default_factory=list)
+
+
+# ── Active tasks dicts ────────────────────────────────────────────────────────
+
+_active_tasks: dict[str, TaskState] = {}       # session_id -> TaskState
+_active_conv_tasks: dict[str, TaskState] = {}  # conv_id -> TaskState
+_tasks_lock = threading.Lock()
+
+
+# ── Push status ───────────────────────────────────────────────────────────────
+
+def _push_status(task: TaskState, message: str):
+    """向 Clawith 推送中间状态，限流 3s/次"""
+    now = time.time()
+    if now - task.last_status_push < 3:
+        return
+    task.last_status_push = now
+
+    # 避免同一状态反复刷屏
+    if message == task.last_progress_text:
+        return
+    task.last_progress_text = message
+
+    try:
+        if CLAWITH_SEND_ENABLED:
+            ok = clawith_send_message(task.conv_id, message)
+            if not ok:
+                log.debug("[push] send API unavailable or failed")
+            return
+
+        # send 通道关闭时，针对 agent-to-agent 会话使用多次 report 做进度更新
+        if PROGRESS_VIA_REPORT and task.sender_is_agent and not task.reported:
+            progress_text = f"⏳ {message}"
+            clawith_report(task.clawith_msg_id, progress_text)
+            log.info(
+                f"[push] progress_report msg={str(task.clawith_msg_id)[:8]} "
+                f"session={task.claude_session_id[:8] if task.claude_session_id else 'none'} "
+                f"text='{_short_text(progress_text)}'"
+            )
+    except Exception as e:
+        log.debug(f"[push] error: {e}")
+
+
+# ── Task completion helpers ───────────────────────────────────────────────────
+
+def _finish_task(task: TaskState, result: str):
+    if task.reported:
+        return
+    task.reported = True
+    with _tasks_lock:
+        _active_tasks.pop(task.claude_session_id, None)
+        # Also remove conv_id key (used before real session_id arrives)
+        _active_tasks.pop(task.conv_id, None)
+        if _active_conv_tasks.get(task.conv_id) is task:
+            _active_conv_tasks.pop(task.conv_id, None)
+    elapsed = int(time.time() - task.start_time)
+    log.info(f"[done] session={task.claude_session_id[:8] if task.claude_session_id else 'none'} ({elapsed}s)")
+    inflight_remove(str(task.clawith_msg_id))
+    clawith_report(task.clawith_msg_id, result)
+
+def _fail_task(task: TaskState, reason: str):
+    _finish_task(task, f"❌ {reason}")
+
+
+# ── High-risk tool check ──────────────────────────────────────────────────────
+
+_HIGH_RISK_TOOLS = {"Bash", "Write", "Edit"}
+
+def _is_high_risk_tool(name: str) -> bool:
+    return name in _HIGH_RISK_TOOLS
+
+
+# ── Permission hook factory ───────────────────────────────────────────────────
+
+def _make_permission_hook(task: TaskState):
+    async def hook(input_data, tool_use_id, context):
+        # PreToolUseHookInput: tool_name is a top-level field, tool_input contains args
+        tool_name = input_data.get("tool_name") or "unknown"
+        tool_input = input_data.get("tool_input", {})
+
+        # Record the tool call
+        task.tool_calls.append(tool_name)
+        log.info(f"  [tool] {tool_name}")
+        _push_status(task, f"正在调用工具: {tool_name}...")
+
+        # Only intercept in default permission mode for high-risk tools
+        if CLAUDE_PERMISSION_MODE != "default" or not _is_high_risk_tool(tool_name):
+            return {}
+
+        # No send channel → auto-deny
+        if not CLAWITH_SEND_ENABLED:
+            log.warning(f"[perm] auto-deny {tool_name} (CLAWITH_SEND_ENABLED=0)")
+            return {"decision": "block"}
+
+        # Ask user via Clawith
+        args_str = json.dumps(tool_input, ensure_ascii=False)[:200]
+        msg = (
+            f"⚠️ **Claude Code 请求权限确认**\n"
+            f"工具: `{tool_name}`\n"
+            + (f"参数: `{args_str}`\n" if args_str else "")
+            + "\n请回复 **允许** 或 **拒绝**"
+        )
+        task.pending_permission.clear()   # clear FIRST before pushing
+        task.last_progress_text = ""  # ensure permission message is not deduped
+        task.last_status_push = 0  # bypass rate-limit for permission msgs
+        _push_status(task, msg)
+
+        # Block until user replies or 120s timeout
+        granted = await anyio.to_thread.run_sync(
+            functools.partial(task.pending_permission.wait, 120)
+        )
+        if not granted:
+            log.warning(f"[perm] timeout waiting for user reply on {tool_name}")
+            task.permission_decision = "deny"
+
+        if task.permission_decision == "allow":
+            log.info(f"[perm] allowed: {tool_name}")
+            return {}
+        log.info(f"[perm] denied: {tool_name}")
+        return {"decision": "block"}
+
+    return hook
+
+
+# ── Permission reply handler ──────────────────────────────────────────────────
+
+def _handle_permission_reply(content: str, conv_id: str) -> bool:
+    c = content.strip()
+    allow = c in ("允许", "allow", "yes", "y", "ok", "确认", "同意")
+    deny  = c in ("拒绝", "deny", "no", "n", "不", "否", "不允许")
+
+    if not allow and not deny:
+        return False
+
+    with _tasks_lock:
+        tasks_snapshot = [t for t in _active_tasks.values() if t.conv_id == conv_id]
+
+    for task in tasks_snapshot:
+        if task.pending_permission.is_set():
+            continue  # already resolved
+        task.permission_decision = "allow" if allow else "deny"
+        task.pending_permission.set()
+        log.info(f"[perm] reply={task.permission_decision} conv={conv_id[:8]}")
+        return True
+
+    return False
+
+
+# ── Core async Claude query ───────────────────────────────────────────────────
+
+async def _claude_query(task: TaskState, content: str):
+    workdir = get_workdir(task.conv_id)
+    try:
+        os.makedirs(workdir, exist_ok=True)
+    except Exception as e:
+        _fail_task(task, f"无法创建工作目录 {workdir}: {e}")
+        return
+
+    kwargs = dict(
+        cwd=workdir,
+        permission_mode=CLAUDE_PERMISSION_MODE,
+        max_turns=CLAUDE_MAX_TURNS,
+        hooks={
+            "PreToolUse": [HookMatcher(matcher="Bash|Write|Edit", hooks=[_make_permission_hook(task)])]
+        },
+    )
+    if task.claude_session_id:
+        kwargs["resume"] = task.claude_session_id
+    if CLAUDE_MODEL:
+        kwargs["model"] = CLAUDE_MODEL
+    if CLAUDE_ALLOWED_TOOLS:
+        kwargs["allowed_tools"] = [t.strip() for t in CLAUDE_ALLOWED_TOOLS.split(",") if t.strip()]
+
+    options = ClaudeAgentOptions(**kwargs)
+
+    try:
+        async for msg in claude_query(prompt=content, options=options):
+            if task.reported:
+                break
+
+            if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                sid = msg.data.get("session_id") if isinstance(msg.data, dict) else None
+                if sid:
+                    task.claude_session_id = sid
+                    _sessions[task.conv_id] = sid
+                    with _tasks_lock:
+                        # Remove old conv_id key, add real session_id key
+                        _active_tasks.pop(task.conv_id, None)
+                        _active_tasks[sid] = task
+                    log.info(f"[session] new session={sid[:8]} conv={task.conv_id[:8]}")
+
+            elif isinstance(msg, AssistantMessage):
+                for block in (msg.content or []):
+                    if isinstance(block, TextBlock) and block.text.strip():
+                        _push_status(task, "AI 正在回复...")
+
+            elif isinstance(msg, ResultMessage):
+                if msg.is_error:
+                    result = f"❌ Claude Code 执行出错\n\n{msg.result or '(无详情)'}"
+                else:
+                    result = msg.result or "(无回复)"
+                    if task.tool_calls:
+                        tools = ", ".join(dict.fromkeys(task.tool_calls))
+                        result = f"*(调用了: {tools})*\n\n{result}"
+                _finish_task(task, result)
+                return
+
+            elif isinstance(msg, RateLimitEvent):
+                _push_status(task, "⏳ API 限流，等待重置...")
+
+    except Exception as e:
+        log.error(f"[claude] error: {e}", exc_info=True)
+        if not task.reported:
+            _fail_task(task, f"Claude Code 执行出错: {e}")
+        return
+
+    # Generator exhausted without ResultMessage
+    if not task.reported:
+        _fail_task(task, "Claude Code 未返回结果（生成器耗尽）")
+
+
+# ── Thread entry point ────────────────────────────────────────────────────────
+
+def _run_claude_task(task: TaskState, content: str):
+    try:
+        anyio.run(_claude_query, task, content)
+    except Exception as e:
+        log.error(f"[thread] anyio.run error: {e}", exc_info=True)
+        if not task.reported:
+            _fail_task(task, f"任务线程异常: {e}")
+
+
+# ── Message processing ────────────────────────────────────────────────────────
+
+def process_message(msg: dict):
+    msg_id  = msg.get("id")
+    content = msg.get("content", "")
+    conv_id = msg.get("conversation_id") or msg_id
+    sender  = msg.get("sender_user_name") or msg.get("sender_agent_name") or "user"
+
+    log.info(
+        f"[msg] recv id={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
+        f"sender='{sender}' text='{_short_text(content)}'"
+    )
+
+    # Check if this is a permission reply
+    if _handle_permission_reply(content, conv_id):
+        clawith_report(msg_id, "✅ 已处理权限请求")
+        return
+
+    # Reject if same conv already has a running task
+    with _tasks_lock:
+        running = _active_conv_tasks.get(conv_id)
+        if running and not running.reported:
+            elapsed = int(time.time() - running.start_time)
+            preview = (running.request_preview or "(上一个任务)").replace("\n", " ")[:80]
+            clawith_report(
+                msg_id,
+                f"⏳ 前面有任务还在处理（已进行 {elapsed}s）\n"
+                f"当前任务: {preview}\n"
+                "请等待该任务完成后再发送新消息。"
+            )
+            return
+
+    # Get or derive session_id
+    existing_session_id = _sessions.get(conv_id, "")
+
+    # Create TaskState
+    task = TaskState(
+        clawith_msg_id=msg_id,
+        conv_id=conv_id,
+        claude_session_id=existing_session_id,
+        request_preview=content,
+        sender_is_agent=bool(msg.get("sender_agent_name")),
+    )
+
+    with _tasks_lock:
+        # Use conv_id as the "session key" in _active_tasks until we have real session_id
+        _active_tasks[conv_id] = task
+        _active_conv_tasks[conv_id] = task
+    inflight_add(str(msg_id), content, str(conv_id))
+
+    log.info(
+        f"[route] msg={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
+        f"session='{existing_session_id[:8] if existing_session_id else 'new'}'"
+    )
+
+    # Spawn thread
+    t = threading.Thread(
+        target=_run_claude_task,
+        args=(task, content),
+        daemon=True,
+        name=f"task-{str(msg_id)[:8]}",
+    )
+    t.start()
+
+
+# ── Timeout monitor ───────────────────────────────────────────────────────────
+
+def timeout_monitor():
+    while True:
+        time.sleep(10)
+        now = time.time()
+        with _tasks_lock:
+            timed_out = [
+                t for t in _active_tasks.values()
+                if not t.reported and now - t.start_time > TASK_TIMEOUT
+            ]
+        for task in timed_out:
+            log.warning(f"[timeout] msg={str(task.clawith_msg_id)[:8]} after {TASK_TIMEOUT}s")
+            _fail_task(task, f"任务超时（超过 {TASK_TIMEOUT}s）")
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    if not CLAWITH_API_KEY:
+        log.error("CLAWITH_API_KEY is not set")
+        sys.exit(1)
+
+    log.info("Clawith Bridge-Claude starting")
+    log.info(f"  Clawith:       {CLAWITH_API_URL}")
+    log.info(f"  Workdir base:  {CLAUDE_WORKDIR_BASE}")
+    log.info(f"  Permission:    {CLAUDE_PERMISSION_MODE}")
+    log.info(f"  Max turns:     {CLAUDE_MAX_TURNS}")
+    log.info(f"  HTTP timeout:  {HTTP_TIMEOUT_SECONDS}s")
+    log.info(f"  HTTP retries:  {HTTP_MAX_RETRIES}")
+
+    recover_inflight()
+
+    threading.Thread(target=timeout_monitor, daemon=True, name="timeout").start()
+
+    clawith_heartbeat()
+    log.info("[startup] ready, polling Clawith...")
+
+    heartbeat_counter = 0
+    idle_poll_counter = 0
+    while True:
+        try:
+            messages = clawith_poll()
+            if messages:
+                idle_poll_counter = 0
+                log.info(f"[poll] {len(messages)} message(s)")
+                for msg in messages:
+                    try:
+                        process_message(msg)
+                    except Exception as e:
+                        log.error(f"process_message error: {e}", exc_info=True)
+                        try:
+                            clawith_report(msg.get("id"), f"处理消息时出错: {e}")
+                        except Exception:
+                            pass
+            else:
+                idle_poll_counter += 1
+                if IDLE_POLL_LOG_EVERY > 0 and idle_poll_counter >= IDLE_POLL_LOG_EVERY:
+                    log.info(f"[poll] idle for {idle_poll_counter * POLL_INTERVAL}s")
+                    idle_poll_counter = 0
+
+            heartbeat_counter += 1
+            if heartbeat_counter >= 12:
+                clawith_heartbeat()
+                heartbeat_counter = 0
+
+        except KeyboardInterrupt:
+            log.info("Shutting down")
+            break
+        except Exception as e:
+            log.error(f"Poll loop error: {e}", exc_info=True)
+
+        time.sleep(POLL_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

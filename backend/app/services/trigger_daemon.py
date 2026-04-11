@@ -279,19 +279,27 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
                     )
                 )
                 from_participant = result.scalar_one_or_none()
-                if not from_participant:
-                    return False
 
-                from sqlalchemy import cast as sa_cast, String as SaString
-                result = await db.execute(
-                    select(ChatMessage).join(
-                        ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
-                    ).where(
-                        ChatMessage.participant_id == from_participant,
-                        ChatMessage.created_at > since,
-                        ChatMessage.role == "assistant",
-                    ).order_by(ChatMessage.created_at.desc()).limit(1)
-                )
+                from sqlalchemy import cast as sa_cast, String as SaString, or_
+                if from_participant:
+                    msg_query = (
+                        select(ChatMessage).join(
+                            ChatSession, ChatMessage.conversation_id == sa_cast(ChatSession.id, SaString)
+                        ).where(
+                            ChatMessage.participant_id == from_participant,
+                            ChatMessage.created_at > since,
+                            ChatMessage.role == "assistant",
+                        ).order_by(ChatMessage.created_at.desc()).limit(1)
+                    )
+                else:
+                    msg_query = (
+                        select(ChatMessage).where(
+                            ChatMessage.agent_id == source_agent.id,
+                            ChatMessage.created_at > since,
+                            ChatMessage.role == "assistant",
+                        ).order_by(ChatMessage.created_at.desc()).limit(1)
+                    )
+                result = await db.execute(msg_query)
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False

@@ -4,6 +4,7 @@ Provides Config CRUD and message handling for DingTalk bots using Stream mode.
 """
 
 import uuid
+from typing import Dict
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from loguru import logger
@@ -18,6 +19,38 @@ from app.models.user import User
 from app.schemas.schemas import ChannelConfigOut
 
 router = APIRouter(tags=["dingtalk"])
+
+# ─── Webhook URL cache ────────────────────────────────
+# Maps ChatSession.id (str) -> session_webhook URL.
+# Populated on first inbound group message; survives in-process but not across restarts.
+# Backed by DB (ChatSession.channel_webhook_url) so a cold-start DB read can repopulate.
+_webhook_cache: Dict[str, str] = {}
+
+
+def cache_session_webhook(session_id: str, webhook_url: str) -> None:
+    """Store DingTalk session webhook URL in the in-process cache."""
+    if webhook_url:
+        _webhook_cache[session_id] = webhook_url
+
+
+async def get_session_webhook(session_id: str) -> str | None:
+    """Return the webhook URL for a DingTalk session.
+
+    Checks in-process cache first; on miss, reads from DB and warms the cache.
+    """
+    if session_id in _webhook_cache:
+        return _webhook_cache[session_id]
+    try:
+        from app.database import async_session as _async_session
+        from app.models.chat_session import ChatSession as _CS
+        async with _async_session() as _db:
+            r = await _db.get(_CS, uuid.UUID(session_id))
+            if r and r.channel_webhook_url:
+                _webhook_cache[session_id] = r.channel_webhook_url
+                return r.channel_webhook_url
+    except Exception as e:
+        logger.warning(f"[DingTalk] get_session_webhook DB miss for {session_id}: {e}")
+    return None
 
 
 # ─── Config CRUD ────────────────────────────────────────
@@ -145,6 +178,7 @@ async def process_dingtalk_message(
     conversation_id: str,
     conversation_type: str,
     session_webhook: str,
+    conversation_title: str = "",
 ):
     """Process an incoming DingTalk bot message and reply via session webhook."""
     import json
@@ -169,13 +203,16 @@ async def process_dingtalk_message(
         from app.models.agent import DEFAULT_CONTEXT_WINDOW_SIZE
         ctx_size = (agent_obj.context_window_size or DEFAULT_CONTEXT_WINDOW_SIZE) if agent_obj else DEFAULT_CONTEXT_WINDOW_SIZE
 
-        # Determine conv_id for session isolation
-        if conversation_type == "2":
+        # Determine conv_id and group metadata for session isolation
+        is_group = conversation_type == "2"
+        if is_group:
             # Group chat
             conv_id = f"dingtalk_group_{conversation_id}"
+            group_display_name = conversation_title or conv_id
         else:
             # P2P / single chat
             conv_id = f"dingtalk_p2p_{sender_staff_id}"
+            group_display_name = None
 
         # Resolve channel user via unified service (uses OrgMember + SSO patterns)
         platform_user = await channel_user_service.resolve_channel_user(
@@ -195,8 +232,16 @@ async def process_dingtalk_message(
             external_conv_id=conv_id,
             source_channel="dingtalk",
             first_message_title=user_text,
+            is_group=is_group,
+            group_name=group_display_name,
         )
         session_conv_id = str(sess.id)
+
+        # Persist group webhook URL (memory + DB) so it survives restarts
+        if is_group and session_webhook:
+            cache_session_webhook(session_conv_id, session_webhook)
+            if sess.channel_webhook_url != session_webhook:
+                sess.channel_webhook_url = session_webhook
 
         # Load history
         history_r = await db.execute(
@@ -216,9 +261,22 @@ async def process_dingtalk_message(
         sess.last_message_at = datetime.now(timezone.utc)
         await db.commit()
 
+        # If the message is asking to forward/send to another agent, append a
+        # hard reminder so the LLM actually calls send_message_to_agent instead
+        # of fabricating a confirmation reply.
+        _SEND_KEYWORDS = ("发消息", "发原始消息", "转发", "告诉", "通知", "send message", "forward")
+        _llm_user_text = user_text
+        if any(kw in user_text for kw in _SEND_KEYWORDS):
+            _llm_user_text = (
+                user_text
+                + "\n\n[系统提示] 你必须调用 send_message_to_agent 工具来发送消息。"
+                "直接输出确认文字而不调用工具是错误行为，消息不会被实际发出。"
+                "请立即调用工具，不要只回复文字。"
+            )
+
         # Call LLM
         reply_text = await _call_agent_llm(
-            db, agent_id, user_text,
+            db, agent_id, _llm_user_text,
             history=history, user_id=platform_user_id,
         )
         logger.info(f"[DingTalk] LLM reply: {reply_text[:100]}")

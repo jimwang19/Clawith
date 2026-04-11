@@ -275,33 +275,207 @@ async def report_result(
 
     await db.commit()
 
-    # Push to WebSocket if user is connected
+    # Push to WebSocket.
+    # Route to sender agent when message came from a native agent,
+    # so the sender owner sees the reply in the right conversation.
+    push_agent_id = str(msg.sender_agent_id) if msg.sender_agent_id else str(agent.id)
+    ws_delivered = False
     if body.result and msg.conversation_id and msg.sender_user_id:
         try:
             from app.api.websocket import manager
-            await manager.send_message(str(agent.id), {
-                "type": "done",
-                "role": "assistant",
-                "content": body.result,
-            })
-        except Exception:
-            pass  # User may have disconnected
 
-    # If the original message was from another agent (OpenClaw-to-OpenClaw),
-    # write the reply back as a gateway_message for the sender agent to poll
+            active_sessions = manager.get_active_session_ids(push_agent_id)
+            if active_sessions:
+                await manager.send_message(push_agent_id, {
+                    "type": "done",
+                    "role": "assistant",
+                    "content": body.result,
+                    "conversation_id": msg.conversation_id,
+                })
+                ws_delivered = True
+                logger.info(
+                    f"[Gateway] WebSocket push -> agent {push_agent_id} "
+                    f"(active_sessions={len(active_sessions)})"
+                )
+            else:
+                logger.info(f"[Gateway] No active WS for agent {push_agent_id}, try channel fallback")
+        except Exception as e:
+            logger.warning(f"[Gateway] WebSocket push failed for agent {push_agent_id}: {e}")
+
+    # DingTalk relay: for agent-to-agent results always relay to jim's DingTalk
+    # (WS only updates UI; DingTalk relay is needed so the upstream human gets notified).
+    # For direct DingTalk sessions, only relay when WS delivery failed.
+    if body.result and msg.conversation_id and msg.sender_user_id:
+        result_text = (body.result or "").strip()
+        if result_text:
+            try:
+                from app.models.chat_session import ChatSession
+                from app.models.channel_config import ChannelConfig
+                from app.models.user import User
+                from app.services.dingtalk_service import send_dingtalk_message
+
+                session_obj = None
+                try:
+                    session_uuid = uuid.UUID(str(msg.conversation_id))
+                    sess_r = await db.execute(select(ChatSession).where(ChatSession.id == session_uuid))
+                    session_obj = sess_r.scalar_one_or_none()
+                except Exception:
+                    session_obj = None
+
+                # Resolve DingTalk session: direct dingtalk session, or agent session whose
+                # push_agent has a DingTalk session (e.g. opencode reports back to 小E).
+                dt_session_obj = None
+                dt_sender_user_id = msg.sender_user_id  # default: use the original sender
+
+                sess_channel = getattr(session_obj, "source_channel", None) if session_obj else None
+                if sess_channel == "dingtalk" and not ws_delivered:
+                    # Direct DingTalk session: only fallback when WS delivery failed
+                    dt_session_obj = session_obj
+                elif sess_channel == "agent" or session_obj is None:
+                    # Agent-to-agent session: find push_agent's most recent DingTalk session
+                    # so the upstream human owner (Jim) gets the fallback notification.
+                    from sqlalchemy import desc
+                    from app.models.chat_session import ChatSession as _CS
+                    dt_sess_r = await db.execute(
+                        select(_CS)
+                        .where(
+                            _CS.agent_id == uuid.UUID(push_agent_id),
+                            _CS.source_channel == "dingtalk",
+                        )
+                        .order_by(desc(_CS.last_message_at))
+                        .limit(1)
+                    )
+                    dt_session_obj = dt_sess_r.scalar_one_or_none()
+                    if dt_session_obj:
+                        # Use the session's user_id (the human who owns that DingTalk session)
+                        dt_sender_user_id = dt_session_obj.user_id or msg.sender_user_id
+                        logger.info(
+                            f"[Gateway] Agent session fallback: resolved DingTalk session "
+                            f"{dt_session_obj.id} user={dt_sender_user_id} for agent {push_agent_id}"
+                        )
+
+                if dt_session_obj:
+                    cfg_r = await db.execute(
+                        select(ChannelConfig).where(
+                            ChannelConfig.agent_id == uuid.UUID(push_agent_id),
+                            ChannelConfig.channel_type == "dingtalk",
+                            ChannelConfig.is_configured == True,
+                        )
+                    )
+                    dt_config = cfg_r.scalar_one_or_none()
+
+                    if dt_config:
+                        is_progress = result_text.startswith("⏳")
+                        if getattr(dt_session_obj, "is_group", False):
+                            # Group session: relay via per-session webhook (no user_id needed)
+                            from app.api.dingtalk import get_session_webhook
+                            import httpx as _httpx
+                            webhook_url = await get_session_webhook(str(dt_session_obj.id))
+                            if webhook_url and not is_progress:
+                                try:
+                                    async with _httpx.AsyncClient(timeout=10) as _c:
+                                        await _c.post(webhook_url, json={
+                                            "msgtype": "markdown",
+                                            "markdown": {
+                                                "title": "AI Reply",
+                                                "text": result_text,
+                                            },
+                                        })
+                                    logger.info(
+                                        f"[Gateway] DingTalk group webhook sent for msg={body.message_id}"
+                                    )
+                                except Exception as _we:
+                                    logger.error(
+                                        f"[Gateway] DingTalk group webhook failed for msg={body.message_id}: {_we}"
+                                    )
+                            elif not webhook_url:
+                                logger.warning(
+                                    f"[Gateway] DingTalk group session: no webhook URL, "
+                                    f"skipping fallback for conv={msg.conversation_id}"
+                                )
+                        else:
+                            # 1-on-1 session: resolve staff_id via OrgMember then send OTO
+                            if not is_progress:
+                                from app.models.org import OrgMember
+                                from app.models.identity import IdentityProvider
+                                dingtalk_user_id = None
+
+                                # Try OrgMember.external_id (preferred)
+                                om_r = await db.execute(
+                                    select(OrgMember.external_id, OrgMember.unionid)
+                                    .join(IdentityProvider, OrgMember.provider_id == IdentityProvider.id)
+                                    .where(
+                                        OrgMember.user_id == dt_sender_user_id,
+                                        IdentityProvider.provider_type.ilike("%dingtalk%"),
+                                    )
+                                    .limit(1)
+                                )
+                                om_row = om_r.first()
+                                if om_row:
+                                    dingtalk_user_id = om_row[0] or om_row[1]
+
+                                # Legacy fallback: username = "dingtalk_<staffid>"
+                                if not dingtalk_user_id:
+                                    user_r = await db.execute(select(User).where(User.id == dt_sender_user_id))
+                                    sender_user = user_r.scalar_one_or_none()
+                                    uname = getattr(sender_user, "username", "") or ""
+                                    if uname.startswith("dingtalk_"):
+                                        dingtalk_user_id = uname[len("dingtalk_"):]
+
+                                if dingtalk_user_id:
+                                    dt_agent_id = (
+                                        (dt_config.extra_config or {}).get("agent_id")
+                                        if getattr(dt_config, "extra_config", None)
+                                        else None
+                                    )
+                                    send_ret = await send_dingtalk_message(
+                                        app_id=dt_config.app_id,
+                                        app_secret=dt_config.app_secret,
+                                        user_id=dingtalk_user_id,
+                                        message=result_text,
+                                        agent_id=dt_agent_id,
+                                    )
+                                    if send_ret.get("errcode") == 0:
+                                        logger.info(
+                                            f"[Gateway] DingTalk fallback sent for msg={body.message_id} user={dingtalk_user_id}"
+                                        )
+                                    else:
+                                        logger.error(
+                                            f"[Gateway] DingTalk fallback failed for msg={body.message_id}: {send_ret}"
+                                        )
+                                else:
+                                    logger.warning(
+                                        f"[Gateway] Cannot resolve DingTalk user_id for user={dt_sender_user_id}; skipping relay"
+                                    )
+            except Exception as e:
+                logger.warning(f"[Gateway] Channel fallback error for msg={body.message_id}: {e}")
+
+    # If the original message was from another OpenClaw agent,
+    # write reply back as gateway_message for sender polling.
+    # Native sender agents receive result via regular chat/ws path; do not enqueue gateway pending.
     if body.result and msg.sender_agent_id:
-        async with async_session() as reply_db:
-            conv_id = msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}"
-            gw_reply = GatewayMessage(
-                agent_id=msg.sender_agent_id,
-                sender_agent_id=agent.id,
-                content=body.result,
-                status="pending",
-                conversation_id=conv_id,
+        src_agent_r = await db.execute(select(Agent).where(Agent.id == msg.sender_agent_id))
+        src_agent = src_agent_r.scalar_one_or_none()
+        src_type = getattr(src_agent, "agent_type", None)
+
+        if src_type == "openclaw":
+            async with async_session() as reply_db:
+                conv_id = msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}"
+                gw_reply = GatewayMessage(
+                    agent_id=msg.sender_agent_id,
+                    sender_agent_id=agent.id,
+                    content=body.result,
+                    status="pending",
+                    conversation_id=conv_id,
+                )
+                reply_db.add(gw_reply)
+                await reply_db.commit()
+                logger.info(f"[Gateway] Reply routed back to sender OpenClaw agent {msg.sender_agent_id}")
+        else:
+            logger.info(
+                f"[Gateway] Sender agent {msg.sender_agent_id} is type={src_type}; "
+                "skip gateway pending echo"
             )
-            reply_db.add(gw_reply)
-            await reply_db.commit()
-            logger.info(f"[Gateway] Reply routed back to sender agent {msg.sender_agent_id}")
 
     return {"status": "ok"}
 

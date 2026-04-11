@@ -1,0 +1,6 @@
+content = open('/app/agent_data/e6b32063-0651-4ce1-9a81-0e8ec78515e5/soul.md').read()
+print(f'Total chars: {len(content)}')
+print(f'Routing section present: {"消息路由判断" in content}')
+print(f'No-chaining rule present: {"禁止再设新 trigger" in content}')
+print(f'--- Chars 1950-2050 ---')
+print(repr(content[1950:2050]))
