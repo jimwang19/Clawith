@@ -77,6 +77,9 @@ CLAUDE_PERMISSION_MODE   = os.environ.get("CLAUDE_PERMISSION_MODE",   "default")
 CLAUDE_ALLOWED_TOOLS     = os.environ.get("CLAUDE_ALLOWED_TOOLS",     "")
 
 INFLIGHT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "inflight.json")
+STATUS_PORT              = int(os.environ.get("BRIDGE_STATUS_PORT", "8765"))
+MAX_CONCURRENT_TASKS     = int(os.environ.get("MAX_CONCURRENT_TASKS", "2"))
+
 _http_fail_streak = 0
 _http_streak_lock = threading.Lock()
 
@@ -308,6 +311,7 @@ class TaskState:
     pending_permission: threading.Event = field(default_factory=threading.Event)
     permission_decision: str = "deny"
     tool_calls: list = field(default_factory=list)
+    _waiting_permission: bool = False
 
 
 # ── Active tasks dicts ────────────────────────────────────────────────────────
@@ -315,6 +319,36 @@ class TaskState:
 _active_tasks: dict[str, TaskState] = {}       # session_id -> TaskState
 _active_conv_tasks: dict[str, TaskState] = {}  # conv_id -> TaskState
 _tasks_lock = threading.Lock()
+
+# ── Concurrency slot management ───────────────────────────────────────────────
+
+_concurrent_count = 0
+_concurrent_lock = threading.Lock()
+
+
+def try_acquire_slot(task: TaskState) -> bool:
+    """尝试获取并发槽位。成功返回 True，超限返回 False。"""
+    global _concurrent_count
+    with _concurrent_lock:
+        if _concurrent_count >= MAX_CONCURRENT_TASKS:
+            return False
+        _concurrent_count += 1
+    with _tasks_lock:
+        _active_tasks[task.conv_id] = task
+        _active_conv_tasks[task.conv_id] = task
+    return True
+
+
+def release_slot(task: TaskState):
+    """释放并发槽位。"""
+    global _concurrent_count
+    with _concurrent_lock:
+        _concurrent_count = max(0, _concurrent_count - 1)
+    with _tasks_lock:
+        _active_tasks.pop(task.claude_session_id, None)
+        _active_tasks.pop(task.conv_id, None)
+        if _active_conv_tasks.get(task.conv_id) is task:
+            _active_conv_tasks.pop(task.conv_id, None)
 
 
 # ── Push status ───────────────────────────────────────────────────────────────
@@ -357,12 +391,7 @@ def _finish_task(task: TaskState, result: str):
     if task.reported:
         return
     task.reported = True
-    with _tasks_lock:
-        _active_tasks.pop(task.claude_session_id, None)
-        # Also remove conv_id key (used before real session_id arrives)
-        _active_tasks.pop(task.conv_id, None)
-        if _active_conv_tasks.get(task.conv_id) is task:
-            _active_conv_tasks.pop(task.conv_id, None)
+    release_slot(task)
     elapsed = int(time.time() - task.start_time)
     log.info(f"[done] session={task.claude_session_id[:8] if task.claude_session_id else 'none'} ({elapsed}s)")
     inflight_remove(str(task.clawith_msg_id))
@@ -397,30 +426,32 @@ def _make_permission_hook(task: TaskState):
         if CLAUDE_PERMISSION_MODE != "default" or not _is_high_risk_tool(tool_name):
             return {}
 
-        # No send channel → auto-deny
-        if not CLAWITH_SEND_ENABLED:
-            log.warning(f"[perm] auto-deny {tool_name} (CLAWITH_SEND_ENABLED=0)")
-            return {"decision": "block"}
-
-        # Ask user via Clawith
+        # 准备权限请求消息
         args_str = json.dumps(tool_input, ensure_ascii=False)[:200]
         msg = (
             f"⚠️ **Claude Code 请求权限确认**\n"
             f"工具: `{tool_name}`\n"
             + (f"参数: `{args_str}`\n" if args_str else "")
-            + "\n请回复 **允许** 或 **拒绝**"
+            + "\n请回复 **允许** 或 **拒绝**，或调用 /session/{task.conv_id}/decide"
         )
-        task.pending_permission.clear()   # clear FIRST before pushing
-        task.last_progress_text = ""  # ensure permission message is not deduped
-        task.last_status_push = 0  # bypass rate-limit for permission msgs
-        _push_status(task, msg)
+        task.pending_permission.clear()
+        task.last_progress_text = ""
+        task.last_status_push = 0
+        task._waiting_permission = True
 
-        # Block until user replies or 120s timeout
+        # 有 send 通道则推送给 Clawith 用户；否则仅通过 /decide 接口等待
+        if CLAWITH_SEND_ENABLED:
+            _push_status(task, msg)
+        else:
+            log.info(f"[perm] waiting for /decide on conv={task.conv_id[:8]} tool={tool_name}")
+
+        # 阻塞等待决策（120s 超时）
         granted = await anyio.to_thread.run_sync(
             functools.partial(task.pending_permission.wait, 120)
         )
+        task._waiting_permission = False
         if not granted:
-            log.warning(f"[perm] timeout waiting for user reply on {tool_name}")
+            log.warning(f"[perm] timeout waiting for decision on {tool_name}, auto-deny")
             task.permission_decision = "deny"
 
         if task.permission_decision == "allow":
@@ -584,10 +615,14 @@ def process_message(msg: dict):
         sender_is_agent=bool(msg.get("sender_agent_name")),
     )
 
-    with _tasks_lock:
-        # Use conv_id as the "session key" in _active_tasks until we have real session_id
-        _active_tasks[conv_id] = task
-        _active_conv_tasks[conv_id] = task
+    # Try to acquire a concurrency slot (global limit MAX_CONCURRENT_TASKS)
+    if not try_acquire_slot(task):
+        log.warning(f"[concurrency] 429 rejected msg={str(msg_id)[:8]} conv={str(conv_id)[:8]}")
+        clawith_report(
+            msg_id,
+            f"429 并发任务已达上限（最多 {MAX_CONCURRENT_TASKS} 个），请稍后重试。"
+        )
+        return
     inflight_add(str(msg_id), content, str(conv_id))
 
     log.info(
@@ -621,6 +656,113 @@ def timeout_monitor():
             _fail_task(task, f"任务超时（超过 {TASK_TIMEOUT}s）")
 
 
+# ── Status HTTP server ────────────────────────────────────────────────────────
+
+import http.server
+
+def _task_status_str(task: TaskState) -> str:
+    if task._waiting_permission:
+        return "waiting_permission"
+    return "running"
+
+def _task_to_dict(task: TaskState) -> dict:
+    return {
+        "msg_id":           str(task.clawith_msg_id),
+        "conv_id":          str(task.conv_id),
+        "status":           _task_status_str(task),
+        "elapsed_s":        int(time.time() - task.start_time),
+        "tool_calls":       list(task.tool_calls),
+        "last_progress":    task.last_progress_text,
+        "request_preview":  (task.request_preview or "")[:120],
+        "result":           None,
+    }
+
+def _json_response(handler, status: int, body: dict):
+    data = json.dumps(body, ensure_ascii=False).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+class _StatusHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        pass  # 屏蔽默认 access log
+
+    def do_GET(self):
+        # GET /status
+        if self.path == "/status":
+            with _tasks_lock:
+                active = [t for t in _active_conv_tasks.values() if not t.reported]
+            _json_response(self, 200, {
+                "active_count":   len(active),
+                "max_concurrent": MAX_CONCURRENT_TASKS,
+                "tasks":          [_task_to_dict(t) for t in active],
+            })
+            return
+
+        # GET /status/{msg_id}
+        if self.path.startswith("/status/"):
+            msg_id = self.path[len("/status/"):]
+            with _tasks_lock:
+                task = next(
+                    (t for t in _active_conv_tasks.values()
+                     if str(t.clawith_msg_id) == msg_id and not t.reported),
+                    None
+                )
+            if task is None:
+                _json_response(self, 404, {"error": "task not found"})
+            else:
+                _json_response(self, 200, _task_to_dict(task))
+            return
+
+        _json_response(self, 404, {"error": "not found"})
+
+    def do_POST(self):
+        import re
+        m = re.match(r"^/session/([^/]+)/decide$", self.path)
+        if m:
+            conv_id = m.group(1)
+            length = int(self.headers.get("Content-Length", 0))
+            try:
+                body = json.loads(self.rfile.read(length).decode()) if length else {}
+            except Exception:
+                _json_response(self, 400, {"error": "invalid JSON"})
+                return
+
+            decision = body.get("decision", "")
+            if decision not in ("allow", "deny"):
+                _json_response(self, 400, {"error": "decision must be 'allow' or 'deny'"})
+                return
+
+            with _tasks_lock:
+                task = _active_conv_tasks.get(conv_id)
+
+            if task is None or task.reported:
+                _json_response(self, 404, {"error": "no active task for conv_id"})
+                return
+
+            if not task._waiting_permission:
+                _json_response(self, 200, {"ok": False, "msg": "没有等待决策的任务"})
+                return
+
+            task.permission_decision = decision
+            task.pending_permission.set()
+            log.info(f"[decide] conv={conv_id[:8]} decision={decision}")
+            _json_response(self, 200, {"ok": True, "msg": f"决策已注入: {decision}"})
+            return
+
+        _json_response(self, 404, {"error": "not found"})
+
+
+def start_status_server():
+    server = http.server.HTTPServer(("127.0.0.1", STATUS_PORT), _StatusHandler)
+    t = threading.Thread(target=server.serve_forever, daemon=True, name="status-server")
+    t.start()
+    log.info(f"[status] HTTP server listening on 127.0.0.1:{STATUS_PORT}")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -639,6 +781,8 @@ def main():
     recover_inflight()
 
     threading.Thread(target=timeout_monitor, daemon=True, name="timeout").start()
+
+    start_status_server()
 
     clawith_heartbeat()
     log.info("[startup] ready, polling Clawith...")

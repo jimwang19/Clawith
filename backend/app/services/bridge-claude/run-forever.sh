@@ -44,6 +44,8 @@ fi
 
 log "run-forever started (pid=$$, bridge_dir=$BRIDGE_DIR)"
 log "CLAWITH_API_URL=${CLAWITH_API_URL:-<not set>}"
+log "MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-2}"
+log "BRIDGE_STATUS_PORT=${BRIDGE_STATUS_PORT:-8765}  (GET /status, POST /session/{conv_id}/decide)"
 
 # ── 找到可用的 python3（需能导入 bridge 依赖）─────────────────────────────────
 
