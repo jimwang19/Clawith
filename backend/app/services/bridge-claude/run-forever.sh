@@ -7,6 +7,7 @@
 #   bash run-forever.sh          # 前台运行（调试）
 #   nohup bash run-forever.sh &  # 后台持久运行
 #   bash run-forever.sh status   # 查询 bridge HTTP 状态与本地进程
+#   bash run-forever.sh monitor  # 快速查看 status/events/errors
 #   bash run-forever.sh env list # 列出可用 CC 环境脚本
 #   bash run-forever.sh env current
 #   bash run-forever.sh env use /mnt/c/Users/jimwa/cc_env_xxx.sh
@@ -128,9 +129,35 @@ show_status() {
     fi
 }
 
+show_monitor() {
+    local status_port
+    status_port="$(resolve_status_port)"
+
+    echo "[monitor] status endpoint"
+    if command -v curl >/dev/null 2>&1; then
+        curl -sS "http://127.0.0.1:${status_port}/status" || echo "  (status unavailable)"
+        echo
+        echo "[monitor] recent events"
+        curl -sS "http://127.0.0.1:${status_port}/events" || echo "  (events unavailable)"
+        echo
+        echo "[monitor] recent errors"
+        curl -sS "http://127.0.0.1:${status_port}/errors" || echo "  (errors unavailable)"
+        echo
+    else
+        echo "[monitor] curl not found"
+    fi
+
+    echo "[monitor] logs tail"
+    tail -n 20 "$LOG_DIR/run-forever.log" 2>/dev/null || true
+}
+
 case "${1:-}" in
     status)
         show_status
+        exit 0
+        ;;
+    monitor)
+        show_monitor
         exit 0
         ;;
     env)

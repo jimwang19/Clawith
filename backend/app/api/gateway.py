@@ -19,6 +19,7 @@ from app.database import get_db, async_session
 from app.models.agent import Agent
 from app.models.gateway_message import GatewayMessage
 from app.models.user import User
+from app.services.activity_logger import log_activity
 from app.schemas.schemas import (
     GatewayPollResponse, GatewayMessageOut, GatewayReportRequest,
     GatewayHistoryItem, GatewayRelationshipItem, GatewaySendMessageRequest,
@@ -121,6 +122,20 @@ async def poll_messages(
         .order_by(GatewayMessage.created_at.asc())
     )
     messages = result.scalars().all()
+
+    # Minimal work-log integration: only log when actual messages are delivered
+    # to avoid poll noise from idle loops.
+    if messages:
+        await log_activity(
+            agent.id,
+            "heartbeat",
+            f"Gateway 拉取到 {len(messages)} 条待处理消息",
+            detail={
+                "source": "gateway",
+                "stage": "poll",
+                "pending_count": len(messages),
+            },
+        )
 
     # Mark as delivered
     now = datetime.now(timezone.utc)
@@ -245,6 +260,16 @@ async def report_result(
     )
     msg = result.scalar_one_or_none()
     if not msg:
+        await log_activity(
+            agent.id,
+            "error",
+            "Gateway 上报失败：message 不存在",
+            detail={
+                "source": "gateway",
+                "stage": "report",
+                "message_id": str(body.message_id),
+            },
+        )
         raise HTTPException(status_code=404, detail="Message not found")
 
     msg.status = "completed"
@@ -274,6 +299,24 @@ async def report_result(
         db.add(assistant_msg)
 
     await db.commit()
+
+    # Write into existing work log panel for gateway/openclaw agents.
+    # Skip frequent progress updates (e.g. "⏳ ...") to keep logs readable.
+    result_text = (body.result or "").strip()
+    if result_text and not result_text.startswith("⏳"):
+        await log_activity(
+            agent.id,
+            "chat_reply",
+            f"Gateway 完成结果上报: {result_text[:80]}",
+            detail={
+                "source": "bridge-claude",
+                "stage": "report_completed",
+                "message_id": str(msg.id),
+                "conversation_id": msg.conversation_id,
+                "sender_agent_id": str(msg.sender_agent_id) if msg.sender_agent_id else None,
+                "sender_user_id": str(msg.sender_user_id) if msg.sender_user_id else None,
+            },
+        )
 
     # Push to WebSocket.
     # Route to sender agent when message came from a native agent,

@@ -21,6 +21,7 @@ import time
 import random
 import logging
 import threading
+from collections import deque
 import urllib.request
 import urllib.error
 import uuid
@@ -92,9 +93,28 @@ SELF_AGENT_NAME          = os.environ.get("BRIDGE_AGENT_NAME",        "cc-agent"
 INFLIGHT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "inflight.json")
 STATUS_PORT              = int(os.environ.get("BRIDGE_STATUS_PORT", "8765"))
 MAX_CONCURRENT_TASKS     = int(os.environ.get("MAX_CONCURRENT_TASKS", "2"))
+MONITOR_EVENTS_MAX       = int(os.environ.get("MONITOR_EVENTS_MAX", "200"))
+MONITOR_ERROR_MAX        = int(os.environ.get("MONITOR_ERROR_MAX", "100"))
 
 _http_fail_streak = 0
 _http_streak_lock = threading.Lock()
+
+_monitor_lock = threading.Lock()
+_monitor_events = deque(maxlen=MONITOR_EVENTS_MAX)
+_monitor_errors = deque(maxlen=MONITOR_ERROR_MAX)
+_monitor_stats = {
+    "started_at": int(time.time()),
+    "messages_received": 0,
+    "tasks_started": 0,
+    "tasks_succeeded": 0,
+    "tasks_failed": 0,
+    "busy_rejected": 0,
+    "concurrency_rejected": 0,
+    "permission_requests": 0,
+    "permission_denied": 0,
+    "permission_allowed": 0,
+    "exceptions": 0,
+}
 
 
 # ── Short text helper ─────────────────────────────────────────────────────────
@@ -105,6 +125,44 @@ def _short_text(text: str, limit: int = 120) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "..."
+
+
+def _monitor_inc(key: str, delta: int = 1):
+    with _monitor_lock:
+        _monitor_stats[key] = int(_monitor_stats.get(key, 0) or 0) + delta
+
+
+def _monitor_event(event: str, level: str = "info", **kwargs):
+    entry = {
+        "ts": int(time.time()),
+        "event": event,
+        "level": level,
+    }
+    entry.update({k: v for k, v in kwargs.items() if v is not None})
+
+    with _monitor_lock:
+        _monitor_events.append(entry)
+        if level in {"warning", "error"}:
+            _monitor_errors.append(entry)
+        if level == "error":
+            _monitor_stats["exceptions"] = int(_monitor_stats.get("exceptions", 0) or 0) + 1
+
+
+def _monitor_snapshot(include_events: bool = False, include_errors: bool = False) -> dict:
+    with _monitor_lock:
+        stats = dict(_monitor_stats)
+        events = list(_monitor_events) if include_events else None
+        errors = list(_monitor_errors) if include_errors else None
+
+    body = {
+        "stats": stats,
+        "uptime_s": max(0, int(time.time()) - int(stats.get("started_at", int(time.time())))),
+    }
+    if events is not None:
+        body["events"] = events
+    if errors is not None:
+        body["errors"] = errors
+    return body
 
 
 def _resolve_cc_env_script() -> str:
@@ -521,10 +579,26 @@ def _finish_task(task: TaskState, result: str):
     release_slot(task)
     elapsed = int(time.time() - task.start_time)
     log.info(f"[done] session={task.claude_session_id[:8] if task.claude_session_id else 'none'} ({elapsed}s)")
+    _monitor_inc("tasks_succeeded", 1)
+    _monitor_event(
+        "task_finished",
+        level="info",
+        msg_id=str(task.clawith_msg_id),
+        conv_id=str(task.conv_id),
+        elapsed_s=elapsed,
+    )
     inflight_remove(str(task.clawith_msg_id))
     clawith_report(task.clawith_msg_id, result)
 
 def _fail_task(task: TaskState, reason: str):
+    _monitor_inc("tasks_failed", 1)
+    _monitor_event(
+        "task_failed",
+        level="error",
+        msg_id=str(task.clawith_msg_id),
+        conv_id=str(task.conv_id),
+        reason=_short_text(reason, 240),
+    )
     _finish_task(task, f"❌ {reason}")
 
 
@@ -547,6 +621,13 @@ def _make_permission_hook(task: TaskState):
         # Record the tool call
         task.tool_calls.append(tool_name)
         log.info(f"  [tool] {tool_name}")
+        _monitor_event(
+            "tool_call",
+            level="info",
+            msg_id=str(task.clawith_msg_id),
+            conv_id=str(task.conv_id),
+            tool=tool_name,
+        )
         _push_status(task, f"正在调用工具: {tool_name}...")
 
         # Only intercept in default permission mode for high-risk tools
@@ -565,6 +646,14 @@ def _make_permission_hook(task: TaskState):
         task.last_progress_text = ""
         task.last_status_push = 0
         task._waiting_permission = True
+        _monitor_inc("permission_requests", 1)
+        _monitor_event(
+            "permission_requested",
+            level="warning",
+            msg_id=str(task.clawith_msg_id),
+            conv_id=str(task.conv_id),
+            tool=tool_name,
+        )
 
         # 有 send 通道则推送给 Clawith 用户；否则仅通过 /decide 接口等待
         if CLAWITH_SEND_ENABLED:
@@ -583,8 +672,24 @@ def _make_permission_hook(task: TaskState):
 
         if task.permission_decision == "allow":
             log.info(f"[perm] allowed: {tool_name}")
+            _monitor_inc("permission_allowed", 1)
+            _monitor_event(
+                "permission_allowed",
+                level="info",
+                msg_id=str(task.clawith_msg_id),
+                conv_id=str(task.conv_id),
+                tool=tool_name,
+            )
             return {}
         log.info(f"[perm] denied: {tool_name}")
+        _monitor_inc("permission_denied", 1)
+        _monitor_event(
+            "permission_denied",
+            level="warning",
+            msg_id=str(task.clawith_msg_id),
+            conv_id=str(task.conv_id),
+            tool=tool_name,
+        )
         return {"decision": "block"}
 
     return hook
@@ -698,10 +803,23 @@ async def _claude_query(task: TaskState, content: str):
                 return
 
             elif isinstance(msg, RateLimitEvent):
+                _monitor_event(
+                    "rate_limited",
+                    level="warning",
+                    msg_id=str(task.clawith_msg_id),
+                    conv_id=str(task.conv_id),
+                )
                 _push_status(task, "⏳ API 限流，等待重置...")
 
     except Exception as e:
         log.error(f"[claude] error: {e}", exc_info=True)
+        _monitor_event(
+            "claude_query_exception",
+            level="error",
+            msg_id=str(task.clawith_msg_id),
+            conv_id=str(task.conv_id),
+            error=_short_text(str(e), 240),
+        )
         if not task.reported:
             _fail_task(task, f"Claude Code 执行出错: {e}")
         return
@@ -718,6 +836,13 @@ def _run_claude_task(task: TaskState, content: str):
         anyio.run(_claude_query, task, content)
     except Exception as e:
         log.error(f"[thread] anyio.run error: {e}", exc_info=True)
+        _monitor_event(
+            "thread_exception",
+            level="error",
+            msg_id=str(task.clawith_msg_id),
+            conv_id=str(task.conv_id),
+            error=_short_text(str(e), 240),
+        )
         if not task.reported:
             _fail_task(task, f"任务线程异常: {e}")
     finally:
@@ -737,6 +862,15 @@ def process_message(msg: dict):
     log.info(
         f"[msg] recv id={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
         f"sender='{sender}' text='{_short_text(content)}'"
+    )
+    _monitor_inc("messages_received", 1)
+    _monitor_event(
+        "message_received",
+        level="info",
+        msg_id=str(msg_id),
+        conv_id=str(conv_id),
+        sender=sender,
+        text=_short_text(content, 180),
     )
 
     # 忽略自身发出的 report 回流消息（防止 busy 拒绝消息形成雪崩循环）
@@ -774,6 +908,14 @@ def process_message(msg: dict):
                 f"当前任务: {preview}\n"
                 "请等待该任务完成后再发送新消息。"
             )
+            _monitor_inc("busy_rejected", 1)
+            _monitor_event(
+                "busy_reject",
+                level="warning",
+                msg_id=str(msg_id),
+                conv_id=str(conv_id),
+                elapsed_s=elapsed,
+            )
             return
 
     # Get or derive session_id
@@ -795,6 +937,14 @@ def process_message(msg: dict):
             msg_id,
             f"429 并发任务已达上限（最多 {MAX_CONCURRENT_TASKS} 个），请稍后重试。"
         )
+        _monitor_inc("concurrency_rejected", 1)
+        _monitor_event(
+            "concurrency_reject",
+            level="warning",
+            msg_id=str(msg_id),
+            conv_id=str(conv_id),
+            max_concurrent=MAX_CONCURRENT_TASKS,
+        )
         return
     inflight_add(str(msg_id), content, str(conv_id))
 
@@ -802,6 +952,15 @@ def process_message(msg: dict):
         f"[route] msg={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
         f"session='{existing_session_id[:8] if existing_session_id else 'new'}' "
         f"({'resume' if existing_session_id else 'new-session'})"
+    )
+    _monitor_inc("tasks_started", 1)
+    _monitor_event(
+        "task_started",
+        level="info",
+        msg_id=str(msg_id),
+        conv_id=str(conv_id),
+        session=(existing_session_id[:8] if existing_session_id else "new"),
+        mode=("resume" if existing_session_id else "new-session"),
     )
 
     # Spawn thread (non-daemon to ensure proper cleanup)
@@ -911,7 +1070,18 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
                 "active_count":   len(active),
                 "max_concurrent": MAX_CONCURRENT_TASKS,
                 "tasks":          [_task_to_dict(t) for t in active],
+                "monitor":        _monitor_snapshot(include_events=False, include_errors=False),
             })
+            return
+
+        # GET /events
+        if self.path == "/events":
+            _json_response(self, 200, _monitor_snapshot(include_events=True, include_errors=False))
+            return
+
+        # GET /errors
+        if self.path == "/errors":
+            _json_response(self, 200, _monitor_snapshot(include_events=False, include_errors=True))
             return
 
         # GET /status/{msg_id}
@@ -1019,6 +1189,13 @@ def main():
                         process_message(msg)
                     except Exception as e:
                         log.error(f"process_message error: {e}", exc_info=True)
+                        _monitor_event(
+                            "process_message_exception",
+                            level="error",
+                            msg_id=str(msg.get("id")),
+                            conv_id=str(msg.get("conversation_id") or msg.get("id")),
+                            error=_short_text(str(e), 240),
+                        )
                         try:
                             clawith_report(msg.get("id"), f"处理消息时出错: {e}")
                         except Exception:
@@ -1040,6 +1217,7 @@ def main():
             break
         except Exception as e:
             log.error(f"Poll loop error: {e}", exc_info=True)
+            _monitor_event("poll_loop_exception", level="error", error=_short_text(str(e), 240))
 
         time.sleep(POLL_INTERVAL)
     

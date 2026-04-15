@@ -4027,7 +4027,7 @@ function AgentDetailInner() {
                                 {/* Filter tabs */}
                                 <div style={{ display: 'flex', gap: '6px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
                                     {filterBtn('user', '👤 ' + t('agent.activityLog.userActions', 'User Actions'))}
-                                    {(agent as any)?.agent_type !== 'openclaw' && (<>
+                                    <>
                                         {filterBtn('backend', '⚙️ ' + t('agent.activityLog.backendServices', 'Backend Services'))}
                                         {(logFilter === 'backend' || logFilter === 'heartbeat' || logFilter === 'schedule' || logFilter === 'messages') && (
                                             <>
@@ -4037,7 +4037,7 @@ function AgentDetailInner() {
                                                 {filterBtn('messages', '📨 ' + t('agent.activityLog.messages'), true)}
                                             </>
                                         )}
-                                    </>)}
+                                    </>
                                 </div>
 
                                 {filteredLogs.length > 0 ? (
@@ -4071,6 +4071,11 @@ function AgentDetailInner() {
                                                             <div style={{ fontWeight: 500, marginBottom: '2px' }}>{log.summary}</div>
                                                             <div style={{ fontSize: '11px', color: 'var(--text-tertiary)' }}>
                                                                 {time} · {log.action_type}
+                                                                {log.detail?.source && (
+                                                                    <span style={{ marginLeft: '8px', color: 'var(--accent-primary)' }}>
+                                                                        {String(log.detail.source)}
+                                                                    </span>
+                                                                )}
                                                                 {log.detail && !isExpanded && <span style={{ marginLeft: '8px', color: 'var(--accent-primary)' }}>▸ Details</span>}
                                                             </div>
                                                         </div>
