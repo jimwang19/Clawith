@@ -13,6 +13,7 @@ Clawith Bridge-Claude — 通过 claude_agent_sdk 连接 Claude Code CLI
 """
 
 import functools
+import glob
 import json
 import os
 import sys
@@ -23,6 +24,8 @@ import threading
 import urllib.request
 import urllib.error
 import uuid
+import signal
+import subprocess
 from dataclasses import dataclass, field
 
 try:
@@ -30,6 +33,13 @@ try:
 except ImportError:
     print("ERROR: claude_agent_sdk not installed. Run: pip install claude-agent-sdk")
     sys.exit(1)
+
+try:
+    import psutil
+except ImportError:
+    log = logging.getLogger("bridge-claude")
+    log.warning("psutil not installed - subprocess cleanup will be limited")
+    psutil = None
 
 import anyio
 from claude_agent_sdk import (
@@ -75,6 +85,9 @@ CLAUDE_MODEL             = os.environ.get("CLAUDE_MODEL",             "")
 CLAUDE_MAX_TURNS         = int(os.environ.get("CLAUDE_MAX_TURNS",     "50"))
 CLAUDE_PERMISSION_MODE   = os.environ.get("CLAUDE_PERMISSION_MODE",   "default")
 CLAUDE_ALLOWED_TOOLS     = os.environ.get("CLAUDE_ALLOWED_TOOLS",     "")
+CC_ENV_SCRIPT            = os.environ.get("CC_ENV_SCRIPT",            "")
+
+SELF_AGENT_NAME          = os.environ.get("BRIDGE_AGENT_NAME",        "cc-agent")
 
 INFLIGHT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "inflight.json")
 STATUS_PORT              = int(os.environ.get("BRIDGE_STATUS_PORT", "8765"))
@@ -92,6 +105,73 @@ def _short_text(text: str, limit: int = 120) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "..."
+
+
+def _resolve_cc_env_script() -> str:
+    """Resolve CC env script path without hardcoded user-specific file names."""
+    # 1) explicit env var has highest priority
+    explicit = os.environ.get("CC_ENV_SCRIPT", "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+
+    # 2) persistent selector file next to runtime scripts
+    selector_file = os.path.join(base_dir, ".cc_env_script")
+    if os.path.exists(selector_file):
+        try:
+            with open(selector_file, "r", encoding="utf-8") as f:
+                selected = (f.readline() or "").strip()
+            if selected and os.path.exists(selected):
+                return selected
+        except Exception:
+            pass
+
+    # 3) optional conventional alias file under any Windows user
+    current_aliases = sorted(glob.glob("/mnt/c/Users/*/cc_env_current.sh"))
+    if current_aliases:
+        return current_aliases[0]
+
+    # 4) final fallback when there is exactly one env script globally
+    all_candidates = sorted(glob.glob("/mnt/c/Users/*/cc_env_*.sh"))
+    if len(all_candidates) == 1:
+        return all_candidates[0]
+
+    return ""
+
+
+def _load_claude_env():
+    """加载 Claude Code 运行环境脚本（WSL 用）。"""
+    script = _resolve_cc_env_script()
+    if not script:
+        log.debug("[env] no CC env script resolved")
+        return
+
+    if not CC_ENV_SCRIPT or not os.path.exists(CC_ENV_SCRIPT):
+        # Keep env in sync for downstream code that reads CC_ENV_SCRIPT.
+        os.environ["CC_ENV_SCRIPT"] = script
+    
+    try:
+        log.info(f"[env] sourcing CC env script: {script}")
+        result = subprocess.run(
+            ["bash", "-c", f"set -a; source '{script}'; set +a; env"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            # 解析环境变量
+            for line in result.stdout.strip().split("\n"):
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key] = value
+            log.info(f"[env] CC environment loaded successfully")
+        else:
+            log.warning(f"[env] failed to source CC env script: {result.stderr}")
+    except subprocess.TimeoutExpired:
+        log.error("[env] timeout sourcing CC env script")
+    except Exception as e:
+        log.error(f"[env] error loading CC env script: {e}")
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
@@ -312,13 +392,20 @@ class TaskState:
     permission_decision: str = "deny"
     tool_calls: list = field(default_factory=list)
     _waiting_permission: bool = False
+    thread: threading.Thread | None = None        # Store thread reference for join()
+    child_pids: list = field(default_factory=list)  # Track spawned child processes
 
 
 # ── Active tasks dicts ────────────────────────────────────────────────────────
 
 _active_tasks: dict[str, TaskState] = {}       # session_id -> TaskState
 _active_conv_tasks: dict[str, TaskState] = {}  # conv_id -> TaskState
+_all_tasks: list[TaskState] = []               # Track all tasks for graceful shutdown
 _tasks_lock = threading.Lock()
+
+# ── Shutdown signal ───────────────────────────────────────────────────────────
+
+_shutdown_event = threading.Event()
 
 # ── Concurrency slot management ───────────────────────────────────────────────
 
@@ -340,8 +427,12 @@ def try_acquire_slot(task: TaskState) -> bool:
 
 
 def release_slot(task: TaskState):
-    """释放并发槽位。"""
+    """释放并发槽位并清理子进程。"""
     global _concurrent_count
+    
+    # 清理子进程
+    _cleanup_child_processes(task)
+    
     with _concurrent_lock:
         _concurrent_count = max(0, _concurrent_count - 1)
     with _tasks_lock:
@@ -349,6 +440,42 @@ def release_slot(task: TaskState):
         _active_tasks.pop(task.conv_id, None)
         if _active_conv_tasks.get(task.conv_id) is task:
             _active_conv_tasks.pop(task.conv_id, None)
+
+
+def _cleanup_child_processes(task: TaskState):
+    """清理任务关联的子进程（Claude Code CLI 及其子进程）。"""
+    if not task.child_pids:
+        return
+    
+    for pid in task.child_pids:
+        try:
+            if psutil:
+                try:
+                    proc = psutil.Process(pid)
+                    if proc.is_running():
+                        # Try graceful termination first
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                            log.info(f"[cleanup] gracefully terminated child pid={pid}")
+                        except subprocess.TimeoutExpired:
+                            # Force kill if not terminated
+                            proc.kill()
+                            proc.wait(timeout=2)
+                            log.warning(f"[cleanup] force-killed child pid={pid}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
+                    log.debug(f"[cleanup] process {pid} already dead or inaccessible: {e}")
+            else:
+                # Fallback: try os.kill if psutil unavailable
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    log.info(f"[cleanup] sent SIGTERM to child pid={pid}")
+                except ProcessLookupError:
+                    log.debug(f"[cleanup] process {pid} not found")
+        except Exception as e:
+            log.error(f"[cleanup] error terminating pid {pid}: {e}")
+    
+    task.child_pids.clear()
 
 
 # ── Push status ───────────────────────────────────────────────────────────────
@@ -490,12 +617,24 @@ def _handle_permission_reply(content: str, conv_id: str) -> bool:
 # ── Core async Claude query ───────────────────────────────────────────────────
 
 async def _claude_query(task: TaskState, content: str):
+    # 加载 Claude Code 环境（仅需一次，但多次调用是安全的）
+    _load_claude_env()
+    
     workdir = get_workdir(task.conv_id)
     try:
         os.makedirs(workdir, exist_ok=True)
     except Exception as e:
         _fail_task(task, f"无法创建工作目录 {workdir}: {e}")
         return
+
+    # Capture current process's children before spawning Claude
+    pid_before = set()
+    if psutil:
+        try:
+            current_proc = psutil.Process()
+            pid_before = {p.pid for p in current_proc.children(recursive=True)}
+        except Exception:
+            pass
 
     kwargs = dict(
         cwd=workdir,
@@ -536,6 +675,18 @@ async def _claude_query(task: TaskState, content: str):
                         _push_status(task, "AI 正在回复...")
 
             elif isinstance(msg, ResultMessage):
+                # Capture new child processes spawned by Claude
+                if psutil:
+                    try:
+                        current_proc = psutil.Process()
+                        pid_after = {p.pid for p in current_proc.children(recursive=True)}
+                        new_pids = pid_after - pid_before
+                        task.child_pids.extend(new_pids)
+                        if new_pids:
+                            log.info(f"[claude] captured {len(new_pids)} child processes: {new_pids}")
+                    except Exception as e:
+                        log.debug(f"[claude] error capturing child pids: {e}")
+                
                 if msg.is_error:
                     result = f"❌ Claude Code 执行出错\n\n{msg.result or '(无详情)'}"
                 else:
@@ -569,6 +720,10 @@ def _run_claude_task(task: TaskState, content: str):
         log.error(f"[thread] anyio.run error: {e}", exc_info=True)
         if not task.reported:
             _fail_task(task, f"任务线程异常: {e}")
+    finally:
+        # Ensure child processes are cleaned up even if exception occurred
+        _cleanup_child_processes(task)
+        log.info(f"[thread] {task.clawith_msg_id} cleanup completed")
 
 
 # ── Message processing ────────────────────────────────────────────────────────
@@ -584,9 +739,27 @@ def process_message(msg: dict):
         f"sender='{sender}' text='{_short_text(content)}'"
     )
 
+    # 忽略自身发出的 report 回流消息（防止 busy 拒绝消息形成雪崩循环）
+    sender_agent = msg.get("sender_agent_name") or ""
+    if sender_agent.lower() == SELF_AGENT_NAME.lower():
+        log.debug(f"[msg] drop self-echo id={str(msg_id)[:8]} sender='{sender_agent}'")
+        return
+
     # Check if this is a permission reply
     if _handle_permission_reply(content, conv_id):
         clawith_report(msg_id, "✅ 已处理权限请求")
+        return
+
+    # ── /new-session 命令：清除当前 conv 的 session，下一条消息开启全新对话 ──
+    stripped = content.strip()
+    if stripped in ("/new-session", "/新会话", "/reset"):
+        old = _sessions.pop(conv_id, None)
+        if old:
+            clawith_report(msg_id, f"✅ 已清除会话（原 session `{old[:8]}...`），下一条消息将开启全新 Claude 会话。")
+            log.info(f"[session] reset conv={str(conv_id)[:8]} old_session={old[:8]}")
+        else:
+            clawith_report(msg_id, "ℹ️ 当前没有已保存的会话，下一条消息本就会开启全新对话。")
+            log.info(f"[session] reset conv={str(conv_id)[:8]} (no session to clear)")
         return
 
     # Reject if same conv already has a running task
@@ -627,23 +800,62 @@ def process_message(msg: dict):
 
     log.info(
         f"[route] msg={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
-        f"session='{existing_session_id[:8] if existing_session_id else 'new'}'"
+        f"session='{existing_session_id[:8] if existing_session_id else 'new'}' "
+        f"({'resume' if existing_session_id else 'new-session'})"
     )
 
-    # Spawn thread
+    # Spawn thread (non-daemon to ensure proper cleanup)
     t = threading.Thread(
         target=_run_claude_task,
         args=(task, content),
-        daemon=True,
+        daemon=False,  # Non-daemon to allow graceful shutdown
         name=f"task-{str(msg_id)[:8]}",
     )
+    task.thread = t  # Store reference for join()
+    with _tasks_lock:
+        _all_tasks.append(task)
     t.start()
+
+
+# ── Graceful shutdown ────────────────────────────────────────────────────────
+
+def _cleanup_all_tasks():
+    """在关闭时等待并清理所有任务。"""
+    log.info("[shutdown] initiating graceful shutdown...")
+    _shutdown_event.set()
+    
+    with _tasks_lock:
+        tasks_snapshot = list(_all_tasks)
+    
+    # First, terminate any Claude subprocesses
+    for task in tasks_snapshot:
+        if not task.reported and task.child_pids:
+            log.info(f"[shutdown] cleaning up child processes for task {str(task.clawith_msg_id)[:8]}")
+            _cleanup_child_processes(task)
+    
+    # Wait for all task threads to finish (with timeout)
+    for task in tasks_snapshot:
+        if task.thread and task.thread.is_alive():
+            timeout = min(10, TASK_TIMEOUT // 5)  # Wait max 10s per thread
+            log.info(f"[shutdown] waiting for thread {task.thread.name} (timeout={timeout}s)")
+            task.thread.join(timeout=timeout)
+            if task.thread.is_alive():
+                log.warning(f"[shutdown] thread {task.thread.name} did not finish after {timeout}s")
+    
+    log.info("[shutdown] graceful shutdown complete")
+
+
+def _signal_handler(signum, frame):
+    """处理 SIGTERM/SIGINT 信号。"""
+    log.info(f"[signal] received signal {signum}, initiating shutdown")
+    _cleanup_all_tasks()
+    sys.exit(0)
 
 
 # ── Timeout monitor ───────────────────────────────────────────────────────────
 
 def timeout_monitor():
-    while True:
+    while not _shutdown_event.is_set():
         time.sleep(10)
         now = time.time()
         with _tasks_lock:
@@ -770,6 +982,12 @@ def main():
         log.error("CLAWITH_API_KEY is not set")
         sys.exit(1)
 
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    if hasattr(signal, 'SIGBREAK'):  # Windows
+        signal.signal(signal.SIGBREAK, _signal_handler)
+
     log.info("Clawith Bridge-Claude starting")
     log.info(f"  Clawith:       {CLAWITH_API_URL}")
     log.info(f"  Workdir base:  {CLAUDE_WORKDIR_BASE}")
@@ -777,6 +995,7 @@ def main():
     log.info(f"  Max turns:     {CLAUDE_MAX_TURNS}")
     log.info(f"  HTTP timeout:  {HTTP_TIMEOUT_SECONDS}s")
     log.info(f"  HTTP retries:  {HTTP_MAX_RETRIES}")
+    log.info(f"  Subprocess mgmt: psutil={'available' if psutil else 'unavailable (fallback to os.kill)'}")
 
     recover_inflight()
 
@@ -789,7 +1008,7 @@ def main():
 
     heartbeat_counter = 0
     idle_poll_counter = 0
-    while True:
+    while not _shutdown_event.is_set():
         try:
             messages = clawith_poll()
             if messages:
@@ -816,12 +1035,15 @@ def main():
                 heartbeat_counter = 0
 
         except KeyboardInterrupt:
-            log.info("Shutting down")
+            log.info("Received keyboard interrupt")
+            _cleanup_all_tasks()
             break
         except Exception as e:
             log.error(f"Poll loop error: {e}", exc_info=True)
 
         time.sleep(POLL_INTERVAL)
+    
+    log.info("[main] poll loop exited")
 
 
 if __name__ == "__main__":
