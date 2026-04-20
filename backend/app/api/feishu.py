@@ -1366,6 +1366,7 @@ async def _call_agent_llm(
     on_chunk=None,
     on_thinking=None,
     on_tool_call=None,
+    force_tool_name: str | None = None,
 ) -> str:
     """Call the agent's configured LLM model with conversation history.
     
@@ -1439,6 +1440,7 @@ async def _call_agent_llm(
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
                 on_tool_call=on_tool_call,
+                force_tool_name=force_tool_name,
             ),
             timeout=_timeout,
         )

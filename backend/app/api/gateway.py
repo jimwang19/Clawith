@@ -32,6 +32,44 @@ def _hash_key(key: str) -> str:
     """Hash an API key for storage."""
     return hashlib.sha256(key.encode()).hexdigest()
 
+def _short_text(text: str, limit: int = 80) -> str:
+    """Truncate text for logging."""
+    s = (text or "").replace("\n", " ").strip()
+    if len(s) <= limit:
+        return s
+    return s[:limit] + "..."
+
+
+def _looks_like_completion_status(text: str) -> bool:
+    """Check if result text looks like a completion/status message that should not be auto-relayed.
+
+    Prevents Morty deadlock: when hermes reports "task completed", we don't want to
+    auto-relay that back to Morty as a new pending message, creating an infinite loop.
+    """
+    if not text:
+        return False
+
+    text_lower = text.lower().strip()
+
+    # Completion indicators
+    completion_keywords = [
+        "task completed", "任务完成", "已完成",
+        "task done", "finished", "完成了",
+        "successfully completed", "成功完成",
+    ]
+
+    # Status report indicators
+    status_keywords = [
+        "status:", "状态:", "progress:", "进度:",
+        "currently working on", "正在处理",
+    ]
+
+    for keyword in completion_keywords + status_keywords:
+        if keyword in text_lower:
+            return True
+
+    return False
+
 
 async def _get_agent_by_key(api_key: str, db: AsyncSession) -> Agent:
     """Authenticate an OpenClaw agent by its API key."""
@@ -350,6 +388,10 @@ async def report_result(
     # For direct DingTalk sessions, only relay when WS delivery failed.
     if body.result and msg.conversation_id and msg.sender_user_id:
         result_text = (body.result or "").strip()
+        # Filter hermes startup banners before relaying to DingTalk
+        if result_text and ("Available Tools" in result_text or "Available Skills" in result_text):
+            logger.info(f"[Gateway] Skipping DingTalk relay: result looks like a startup banner")
+            result_text = ""
         if result_text:
             try:
                 from app.models.chat_session import ChatSession
@@ -497,28 +539,35 @@ async def report_result(
     # write reply back as gateway_message for sender polling.
     # Native sender agents receive result via regular chat/ws path; do not enqueue gateway pending.
     if body.result and msg.sender_agent_id:
-        src_agent_r = await db.execute(select(Agent).where(Agent.id == msg.sender_agent_id))
-        src_agent = src_agent_r.scalar_one_or_none()
-        src_type = getattr(src_agent, "agent_type", None)
-
-        if src_type == "openclaw":
-            async with async_session() as reply_db:
-                conv_id = msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}"
-                gw_reply = GatewayMessage(
-                    agent_id=msg.sender_agent_id,
-                    sender_agent_id=agent.id,
-                    content=body.result,
-                    status="pending",
-                    conversation_id=conv_id,
-                )
-                reply_db.add(gw_reply)
-                await reply_db.commit()
-                logger.info(f"[Gateway] Reply routed back to sender OpenClaw agent {msg.sender_agent_id}")
-        else:
+        # Block auto-relay of completion messages to prevent Morty deadlock loop
+        if _looks_like_completion_status(body.result):
             logger.info(
-                f"[Gateway] Sender agent {msg.sender_agent_id} is type={src_type}; "
-                "skip gateway pending echo"
+                f"[Gateway] Result looks like completion/status, skipping auto-relay to sender "
+                f"(prevents Morty deadlock): {_short_text(body.result, 60)}"
             )
+        else:
+            src_agent_r = await db.execute(select(Agent).where(Agent.id == msg.sender_agent_id))
+            src_agent = src_agent_r.scalar_one_or_none()
+            src_type = getattr(src_agent, "agent_type", None)
+
+            if src_type == "openclaw":
+                async with async_session() as reply_db:
+                    conv_id = msg.conversation_id or f"gw_agent_{msg.sender_agent_id}_{agent.id}"
+                    gw_reply = GatewayMessage(
+                        agent_id=msg.sender_agent_id,
+                        sender_agent_id=agent.id,
+                        content=body.result,
+                        status="pending",
+                        conversation_id=conv_id,
+                    )
+                    reply_db.add(gw_reply)
+                    await reply_db.commit()
+                    logger.info(f"[Gateway] Reply routed back to sender OpenClaw agent {msg.sender_agent_id}")
+            else:
+                logger.info(
+                    f"[Gateway] Sender agent {msg.sender_agent_id} is type={src_type}; "
+                    "skip gateway pending echo"
+                )
 
     return {"status": "ok"}
 

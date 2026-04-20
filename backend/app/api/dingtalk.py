@@ -250,7 +250,11 @@ async def process_dingtalk_message(
             .order_by(ChatMessage.created_at.desc())
             .limit(ctx_size)
         )
-        history = [{"role": m.role, "content": m.content} for m in reversed(history_r.scalars().all())]
+        history = [
+            {"role": m.role, "content": m.content}
+            for m in reversed(history_r.scalars().all())
+            if m.role in ("user", "assistant")
+        ]
 
         # Save user message
         db.add(ChatMessage(
@@ -264,22 +268,104 @@ async def process_dingtalk_message(
         # If the message is asking to forward/send to another agent, append a
         # hard reminder so the LLM actually calls send_message_to_agent instead
         # of fabricating a confirmation reply.
-        _SEND_KEYWORDS = ("发消息", "发原始消息", "转发", "告诉", "通知", "send message", "forward")
+        _SEND_KEYWORDS = ("发消息", "发原始消息", "转发", "转给", "告诉", "通知", "让他", "让她", "帮我发", "send message", "forward", "relay")
+        _KNOWN_AGENTS = ("cc-agent", "hermes-agent", "opencode-agent", "hermes", "meeseeks")
+        # Search-intent keywords: require live/external info or research → delegate to hermes
+        _SEARCH_VERBS = ("查一下", "搜索", "搜一下", "查询", "调研", "搜集", "帮我查", "帮我搜",
+                         "整理", "汇总", "总结一下", "了解", "search", "look up", "find out", "research")
+        _SEARCH_NOUNS = ("新闻", "政策", "最新", "最近", "近期", "动态", "进展", "更新", "资讯", "消息", "报道",
+                         "功能", "特点", "最佳实践", "使用方法", "教程", "指南", "文档", "介绍", "分析", "对比")
         _llm_user_text = user_text
+        _force_tool: str | None = None
         if any(kw in user_text for kw in _SEND_KEYWORDS):
+            # Detect explicit agent name in message to hint the LLM
+            _target_hint = ""
+            for _agent in _KNOWN_AGENTS:
+                if _agent.lower() in user_text.lower():
+                    _target_hint = f' Set agent_name="{_agent}" in the tool call.'
+                    break
             _llm_user_text = (
                 user_text
-                + "\n\n[系统提示] 你必须调用 send_message_to_agent 工具来发送消息。"
-                "直接输出确认文字而不调用工具是错误行为，消息不会被实际发出。"
-                "请立即调用工具，不要只回复文字。"
+                + "\n\n[Tool Reminder] You MUST call the send_message_to_agent tool now."
+                " Do NOT reply with text only — the message will NOT be delivered unless"
+                f" you invoke the tool. Call it immediately without any preamble.{_target_hint}"
             )
+            _force_tool = "send_message_to_agent"
+        elif (any(kw in user_text for kw in _SEARCH_VERBS)
+              and any(kw in user_text for kw in _SEARCH_NOUNS)):
+            # User wants live information search → delegate to hermes
+            _llm_user_text = (
+                user_text
+                + "\n\n[Tool Reminder] This task requires searching current/live information."
+                " You MUST delegate to hermes-agent using the send_message_to_agent tool."
+                ' Set agent_name="hermes-agent". Call the tool immediately.'
+            )
+            _force_tool = "send_message_to_agent"
 
-        # Call LLM
-        reply_text = await _call_agent_llm(
-            db, agent_id, _llm_user_text,
-            history=history, user_id=platform_user_id,
-        )
-        logger.info(f"[DingTalk] LLM reply: {reply_text[:100]}")
+        # Call LLM — track whether send_message_to_agent was actually invoked
+        from app.services import agent_tools as _at_mod
+        _original_execute = _at_mod.execute_tool
+        _send_was_called = False
+
+        async def _tracking_execute(tool_name, tool_args, **kwargs):
+            nonlocal _send_was_called
+            if tool_name == "send_message_to_agent":
+                _send_was_called = True
+            return await _original_execute(tool_name, tool_args, **kwargs)
+
+        _at_mod.execute_tool = _tracking_execute
+        try:
+            reply_text = await _call_agent_llm(
+                db, agent_id, _llm_user_text,
+                history=history, user_id=platform_user_id,
+                force_tool_name=_force_tool,
+            )
+        finally:
+            _at_mod.execute_tool = _original_execute
+
+        # Anti-hallucination guard: if the reply claims to have sent/delegated but
+        # no tool was actually called, retry with force_tool_name.
+        # Guard fires whenever the LLM claims to have delegated — regardless of whether
+        # _force_tool was set — so greetings that don't claim delegation are safe.
+        _CLAIM_KEYWORDS = ("已转给", "已发送", "已转发", "已通知", "已委派", "已安排",
+                           "转达给", "发给了", "sent to", "forwarded to", "delegated to")
+        _reply_claims_send = any(kw in reply_text for kw in _CLAIM_KEYWORDS)
+        if _reply_claims_send and not _send_was_called:
+            logger.warning(
+                f"[DingTalk] Anti-hallucination: agent claimed to send but no tool was called. "
+                f"Retrying with force_tool_name. agent={agent_id}, reply={reply_text[:120]}"
+            )
+            # Retry: inject a hard prompt reminder + force tool choice
+            _retry_text = (
+                _llm_user_text
+                + "\n\n[SYSTEM OVERRIDE] You MUST call send_message_to_agent RIGHT NOW."
+                " Do NOT output any text. Call the tool immediately."
+            )
+            _send_was_called = False
+            _at_mod.execute_tool = _tracking_execute
+            try:
+                # Do NOT pass history: the hallucinated "already sent" assistant turn
+                # would cause the LLM to skip the tool call again.
+                reply_text = await _call_agent_llm(
+                    db, agent_id, _retry_text,
+                    history=[], user_id=platform_user_id,
+                    force_tool_name="send_message_to_agent",
+                )
+                logger.info(f"[DingTalk] Retry reply (send_called={_send_was_called}): {reply_text[:100]}")
+            except Exception as _retry_exc:
+                logger.error(f"[DingTalk] Anti-hallucination retry raised exception: {_retry_exc}")
+                reply_text = ""
+            finally:
+                _at_mod.execute_tool = _original_execute
+            if not _send_was_called:
+                logger.error(
+                    f"[DingTalk] Anti-hallucination retry also failed. agent={agent_id}"
+                )
+                reply_text = (
+                    "⚠️ 抱歉，消息发送未成功执行，请重新告诉我你的需求。"
+                )
+
+        logger.info(f"[DingTalk] LLM reply (send_called={_send_was_called}): {reply_text[:100]}")
 
         # Reply via session webhook (markdown)
         try:

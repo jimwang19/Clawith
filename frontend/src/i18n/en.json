@@ -79,6 +79,8 @@
     "usernamePlaceholder": "Enter username",
     "passwordPlaceholder": "Enter password",
     "emailPlaceholder": "you@example.com",
+    "loginIdentifier": "Username / Email",
+    "loginIdentifierPlaceholder": "username or email",
     "forgotPassword": "Forgot password?",
     "forgotPasswordTitle": "Forgot password",
     "forgotPasswordSubtitle": "Enter your account email and we will send a reset link if the account exists.",

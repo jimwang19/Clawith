@@ -17,15 +17,18 @@ import json
 import os
 import sys
 import time
+import random
 import logging
 import threading
 import urllib.request
 import urllib.error
 import uuid
+from collections import deque
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CLAWITH_API_URL  = os.environ.get("CLAWITH_API_URL",  "http://100.123.217.100:8000")
+CLAWITH_API_URL  = os.environ.get("CLAWITH_API_URL",  "http://127.0.0.1:8000")
 CLAWITH_API_KEY  = os.environ.get("CLAWITH_API_KEY",  "")
 OPENCODE_HOST    = os.environ.get("OPENCODE_HOST",    "127.0.0.1")
 OPENCODE_PORT    = int(os.environ.get("OPENCODE_PORT", "4096"))
@@ -38,18 +41,81 @@ PROGRESS_VIA_REPORT = os.environ.get("PROGRESS_VIA_REPORT", "1") == "1"
 INFLIGHT_RECOVER_MAX_AGE = int(os.environ.get("INFLIGHT_RECOVER_MAX_AGE", "900"))
 BRIDGE_TRACE_IO = os.environ.get("BRIDGE_TRACE_IO", "1") == "1"
 TRACE_TEXT_LIMIT = int(os.environ.get("TRACE_TEXT_LIMIT", "240"))
+HTTP_TIMEOUT_SECONDS  = int(os.environ.get("HTTP_TIMEOUT_SECONDS", "10"))
+HTTP_MAX_RETRIES      = int(os.environ.get("HTTP_MAX_RETRIES", "2"))
+HTTP_RETRY_BASE_DELAY = float(os.environ.get("HTTP_RETRY_BASE_DELAY", "0.7"))
+HTTP_RETRY_MAX_DELAY  = float(os.environ.get("HTTP_RETRY_MAX_DELAY", "5"))
+HTTP_RETRY_JITTER     = float(os.environ.get("HTTP_RETRY_JITTER", "0.25"))
+
+SELF_AGENT_NAME  = os.environ.get("BRIDGE_AGENT_NAME", "hermes-agent")
+MAX_CONCURRENT_TASKS = int(os.environ.get("MAX_CONCURRENT_TASKS", "2"))
+STATUS_PORT      = int(os.environ.get("BRIDGE_STATUS_PORT", "8766"))
+MONITOR_EVENTS_MAX = int(os.environ.get("MONITOR_EVENTS_MAX", "200"))
+MONITOR_ERROR_MAX  = int(os.environ.get("MONITOR_ERROR_MAX", "100"))
 
 OPENCODE_URL = os.environ.get("OPENCODE_URL", f"http://{OPENCODE_HOST}:{OPENCODE_PORT}")
 INFLIGHT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "inflight.json")
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
+os.makedirs(os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"), exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("bridge")
+
+# ── Monitor (in-memory event queue & stats) ───────────────────────────────────
+
+_monitor_lock   = threading.Lock()
+_monitor_events = deque(maxlen=MONITOR_EVENTS_MAX)
+_monitor_errors = deque(maxlen=MONITOR_ERROR_MAX)
+_monitor_stats  = {
+    "started_at":            int(time.time()),
+    "messages_received":     0,
+    "tasks_started":         0,
+    "tasks_succeeded":       0,
+    "tasks_failed":          0,
+    "busy_rejected":         0,
+    "concurrency_rejected":  0,
+    "permission_requests":   0,
+    "permission_denied":     0,
+    "permission_allowed":    0,
+    "exceptions":            0,
+}
+
+
+def _monitor_inc(key: str, delta: int = 1):
+    with _monitor_lock:
+        _monitor_stats[key] = int(_monitor_stats.get(key, 0) or 0) + delta
+
+
+def _monitor_event(event: str, level: str = "info", **kwargs):
+    entry = {"ts": int(time.time()), "event": event, "level": level}
+    entry.update({k: v for k, v in kwargs.items() if v is not None})
+    with _monitor_lock:
+        _monitor_events.append(entry)
+        if level in {"warning", "error"}:
+            _monitor_errors.append(entry)
+        if level == "error":
+            _monitor_stats["exceptions"] = int(_monitor_stats.get("exceptions", 0) or 0) + 1
+
+
+def _monitor_snapshot(include_events: bool = False, include_errors: bool = False) -> dict:
+    with _monitor_lock:
+        stats  = dict(_monitor_stats)
+        events = list(_monitor_events) if include_events else None
+        errors = list(_monitor_errors) if include_errors else None
+    body = {
+        "stats":    stats,
+        "uptime_s": max(0, int(time.time()) - int(stats.get("started_at", int(time.time())))),
+    }
+    if events is not None:
+        body["events"] = events
+    if errors is not None:
+        body["errors"] = errors
+    return body
 
 
 def _short_text(text: str, limit: int = 120) -> str:
@@ -90,23 +156,38 @@ def _trace(event: str, **fields):
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
-def _http(method: str, url: str, data=None, headers=None, timeout=30):
+def _http(method: str, url: str, data=None, headers=None, timeout=None):
+    """HTTP 请求，对网络错误/5xx 做指数退避重试。"""
+    if timeout is None:
+        timeout = HTTP_TIMEOUT_SECONDS
     req_headers = {"Content-Type": "application/json"}
     if headers:
         req_headers.update(headers)
     body = json.dumps(data).encode() if data is not None else None
-    req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode()
-            return resp.status, json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
-        log.error(f"HTTP {e.code} {method} {url}: {raw[:200]}")
-        return e.code, {}
-    except Exception as e:
-        log.error(f"Request failed {method} {url}: {e}")
-        return 0, {}
+
+    attempt = 0
+    while True:
+        req = urllib.request.Request(url, data=body, headers=req_headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode()
+                return resp.status, json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode()
+            if e.code < 500 or attempt >= HTTP_MAX_RETRIES:
+                log.error(f"HTTP {e.code} {method} {url}: {raw[:200]}")
+                return e.code, {}
+        except Exception as e:
+            if attempt >= HTTP_MAX_RETRIES:
+                log.error(f"Request failed {method} {url}: {e}")
+                return 0, {}
+
+        attempt += 1
+        delay = min(HTTP_RETRY_BASE_DELAY * (2 ** (attempt - 1)), HTTP_RETRY_MAX_DELAY)
+        delay += random.uniform(0, HTTP_RETRY_JITTER)
+        log.warning(f"[http] retry {attempt}/{HTTP_MAX_RETRIES} {method} {url} in {delay:.1f}s")
+        time.sleep(delay)
+
 
 # ── Clawith API ───────────────────────────────────────────────────────────────
 
@@ -341,6 +422,27 @@ _tasks_lock = threading.Lock()
 # conv_id -> opencode_session_id（跨消息复用 session）
 _sessions: dict[str, str] = {}
 
+# ── 全局并发控制 ──────────────────────────────────────────────────────────────
+
+_concurrent_count = 0
+_concurrent_lock  = threading.Lock()
+
+
+def try_acquire_slot(task: "TaskState") -> bool:
+    global _concurrent_count
+    with _concurrent_lock:
+        if _concurrent_count >= MAX_CONCURRENT_TASKS:
+            return False
+        _concurrent_count += 1
+        return True
+
+
+def release_slot():
+    global _concurrent_count
+    with _concurrent_lock:
+        if _concurrent_count > 0:
+            _concurrent_count -= 1
+
 def restore_sessions_from_opencode():
     """bridge 启动时，从 OpenCode 已有 session 中恢复 conv_id -> session_id 映射
     避免 bridge 重启后对同一 conversation 重复创建 session"""
@@ -495,6 +597,20 @@ def _finish_task_with_result(task: TaskState, result: str, reason: str):
         _active_tasks.pop(task.opencode_session_id, None)
         if _active_conv_tasks.get(task.conv_id) is task:
             _active_conv_tasks.pop(task.conv_id, None)
+    release_slot()
+
+    elapsed = int(time.time() - task.start_time)
+    is_failure = reason in ("permission denied without send channel",) or result.startswith("❌")
+    if is_failure:
+        _monitor_inc("tasks_failed")
+        _monitor_event("task_failed", level="error",
+                       msg_id=str(task.clawith_msg_id), conv_id=str(task.conv_id),
+                       elapsed_s=elapsed, reason=reason)
+    else:
+        _monitor_inc("tasks_succeeded")
+        _monitor_event("task_finished", level="info",
+                       msg_id=str(task.clawith_msg_id), conv_id=str(task.conv_id),
+                       elapsed_s=elapsed)
 
     log.info(f"[done] {task.opencode_session_id[:8]} → Clawith ({reason})")
     _trace(
@@ -518,6 +634,7 @@ def _finalize_task(task: TaskState, status: str):
         _active_tasks.pop(task.opencode_session_id, None)
         if _active_conv_tasks.get(task.conv_id) is task:
             _active_conv_tasks.pop(task.conv_id, None)
+    release_slot()
 
     messages = opencode_get_messages(task.opencode_session_id)
     result = extract_final_text(messages)
@@ -530,6 +647,16 @@ def _finalize_task(task: TaskState, status: str):
 
     elapsed = int(time.time() - task.start_time)
     log.info(f"[done] {task.opencode_session_id[:8]} ({elapsed}s) → Clawith")
+    if status == "error":
+        _monitor_inc("tasks_failed")
+        _monitor_event("task_failed", level="error",
+                       msg_id=str(task.clawith_msg_id), conv_id=str(task.conv_id),
+                       elapsed_s=elapsed, reason="opencode error")
+    else:
+        _monitor_inc("tasks_succeeded")
+        _monitor_event("task_finished", level="info",
+                       msg_id=str(task.clawith_msg_id), conv_id=str(task.conv_id),
+                       elapsed_s=elapsed, tools=list(dict.fromkeys(task.tool_calls)))
     _trace(
         "bridge.finalize",
         status=status,
@@ -625,6 +752,12 @@ def _check_session_and_report(task: TaskState, reason: str):
         _active_tasks.pop(task.opencode_session_id, None)
         if _active_conv_tasks.get(task.conv_id) is task:
             _active_conv_tasks.pop(task.conv_id, None)
+    release_slot()
+    elapsed = int(time.time() - task.start_time)
+    _monitor_inc("tasks_succeeded")
+    _monitor_event("task_finished", level="info",
+                   msg_id=str(task.clawith_msg_id), conv_id=str(task.conv_id),
+                   elapsed_s=elapsed, via=reason)
     clawith_report(task.clawith_msg_id, result_text)
     log.info(f"[done] {task.opencode_session_id[:8]} -> Clawith (via {reason})")
 
@@ -692,9 +825,24 @@ def process_message(msg: dict):
     history = msg.get("history", [])
     sender  = msg.get("sender_user_name") or msg.get("sender_agent_name") or "user"
 
+    # 自回声过滤：丢弃 bridge 自己发出的消息（避免 busy 拒绝消息导致循环）
+    sender_agent = (msg.get("sender_agent_name") or "").strip()
+    if sender_agent.lower() == SELF_AGENT_NAME.lower():
+        log.debug(f"[msg] drop self-echo id={str(msg_id)[:8]} sender='{sender_agent}'")
+        return
+
     log.info(
         f"[msg] recv id={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
         f"sender='{sender}' text='{_short_text(content)}'"
+    )
+    _monitor_inc("messages_received")
+    _monitor_event(
+        "message_received",
+        level="info",
+        msg_id=str(msg_id),
+        conv_id=str(conv_id),
+        sender=sender,
+        text=_short_text(content, 180),
     )
     _trace(
         "bridge.inbound",
@@ -736,6 +884,14 @@ def process_message(msg: dict):
                 f"[msg] rejected_busy id={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
                 f"active_session={running_task.opencode_session_id[:8]} elapsed={elapsed}s"
             )
+            _monitor_inc("busy_rejected")
+            _monitor_event(
+                "busy_reject",
+                level="warning",
+                msg_id=str(msg_id),
+                conv_id=str(conv_id),
+                elapsed_s=elapsed,
+            )
             _trace(
                 "bridge.rejected_busy",
                 msg_id=str(msg_id),
@@ -746,12 +902,36 @@ def process_message(msg: dict):
             )
             return
 
+    # 全局并发控制（超限直接拒绝，返回 429）
+    task_placeholder = type("_T", (), {"conv_id": conv_id})()
+    if not try_acquire_slot(task_placeholder):
+        clawith_report(
+            msg_id,
+            f"429 并发任务已达上限（最多 {MAX_CONCURRENT_TASKS} 个），请稍后重试。"
+        )
+        log.warning(
+            f"[msg] concurrency_rejected id={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
+            f"concurrent={_concurrent_count}/{MAX_CONCURRENT_TASKS}"
+        )
+        _monitor_inc("concurrency_rejected")
+        _monitor_event(
+            "concurrency_reject",
+            level="warning",
+            msg_id=str(msg_id),
+            conv_id=str(conv_id),
+            max_concurrent=MAX_CONCURRENT_TASKS,
+        )
+        return
+
     # 获取或创建 OpenCode session
     session_id = _sessions.get(conv_id)
     if not session_id:
         session_id = opencode_create_session(f"clawith-{conv_id}")
         if not session_id:
             log.error("Failed to create OpenCode session")
+            release_slot()
+            _monitor_event("session_create_failed", level="error",
+                           msg_id=str(msg_id), conv_id=str(conv_id))
             clawith_report(msg_id, "❌ 无法创建 OpenCode 会话，请检查 opencode serve 是否运行")
             return
         _sessions[conv_id] = session_id
@@ -778,6 +958,15 @@ def process_message(msg: dict):
         f"[route] msg={str(msg_id)[:8]} conv={str(conv_id)[:8]} "
         f"-> session={session_id[:8]}"
     )
+    _monitor_inc("tasks_started")
+    _monitor_event(
+        "task_started",
+        level="info",
+        msg_id=str(msg_id),
+        conv_id=str(conv_id),
+        session_id=str(session_id),
+        text=_short_text(content, 180),
+    )
     _trace(
         "bridge.route",
         msg_id=str(msg_id),
@@ -793,6 +982,7 @@ def process_message(msg: dict):
             _active_tasks.pop(session_id, None)
             if _active_conv_tasks.get(conv_id) is task:
                 _active_conv_tasks.pop(conv_id, None)
+        release_slot()
         log.error("Failed to send async prompt")
         _trace(
             "bridge.route_failed",
@@ -805,7 +995,121 @@ def process_message(msg: dict):
 
     log.info(f"[msg] queued → session {session_id[:8]}, waiting for SSE...")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Status HTTP Server ─────────────────────────────────────────────────────────
+
+
+def _task_to_dict(task: TaskState) -> dict:
+    return {
+        "msg_id":          str(task.clawith_msg_id),
+        "conv_id":         str(task.conv_id),
+        "session_id":      str(task.opencode_session_id),
+        "status":          "running" if not task.reported else "done",
+        "elapsed_s":       int(time.time() - task.start_time),
+        "tool_calls":      list(task.tool_calls),
+        "last_progress":   task.last_progress_text,
+        "request_preview": (task.request_preview or "")[:120],
+    }
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # suppress default access log
+        pass
+
+    def _send_json(self, code: int, body: dict):
+        data = json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length) if length else b""
+        try:
+            return json.loads(raw) if raw else {}
+        except Exception:
+            return {}
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/status":
+            with _tasks_lock:
+                tasks = [_task_to_dict(t) for t in _active_tasks.values() if not t.reported]
+            self._send_json(200, {
+                "active_count":   len(tasks),
+                "max_concurrent": MAX_CONCURRENT_TASKS,
+                "tasks":          tasks,
+                "monitor":        _monitor_snapshot(include_events=False, include_errors=False),
+            })
+        elif path == "/events":
+            self._send_json(200, _monitor_snapshot(include_events=True, include_errors=False))
+        elif path == "/errors":
+            self._send_json(200, _monitor_snapshot(include_events=False, include_errors=True))
+        elif path.startswith("/status/"):
+            msg_id = path[len("/status/"):]
+            with _tasks_lock:
+                found = next(
+                    (t for t in _active_tasks.values()
+                     if str(t.clawith_msg_id) == msg_id and not t.reported),
+                    None,
+                )
+            if found:
+                self._send_json(200, _task_to_dict(found))
+            else:
+                self._send_json(404, {"error": "not found"})
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        parts = path.strip("/").split("/")
+
+        # POST /session/{conv_id}/decide  → inject allow/deny
+        if len(parts) == 3 and parts[0] == "session" and parts[2] == "decide":
+            conv_id = parts[1]
+            body = self._read_body()
+            decision = body.get("decision", "")
+            if decision not in ("allow", "deny"):
+                self._send_json(400, {"error": "decision must be 'allow' or 'deny'"})
+                return
+
+            with _tasks_lock:
+                tasks_for_conv = [
+                    t for t in _active_tasks.values()
+                    if str(t.conv_id) == conv_id and not t.reported
+                ]
+            handled = 0
+            for task in tasks_for_conv:
+                for perm_id in list(task.pending_permissions.keys()):
+                    opencode_respond_permission(task.opencode_session_id, perm_id, decision)
+                    del task.pending_permissions[perm_id]
+                    handled += 1
+            self._send_json(200, {"ok": True, "handled": handled, "conv_id": conv_id})
+
+        # POST /session/{conv_id}/new-session  → clear session cache for conv
+        elif len(parts) == 3 and parts[0] == "session" and parts[2] == "new-session":
+            conv_id = parts[1]
+            old_session = _sessions.pop(conv_id, None)
+            log.info(f"[new-session] conv={conv_id[:8]} cleared session={old_session and old_session[:8]}")
+            self._send_json(200, {
+                "ok": True,
+                "conv_id": conv_id,
+                "cleared_session": old_session,
+            })
+
+        else:
+            self._send_json(404, {"error": "not found"})
+
+
+def start_status_server():
+    server = HTTPServer(("127.0.0.1", STATUS_PORT), _StatusHandler)
+    t = threading.Thread(target=server.serve_forever, name="status-http", daemon=True)
+    t.start()
+    log.info(f"[status] HTTP server listening on 127.0.0.1:{STATUS_PORT}")
+
+
+
 
 def wait_for_opencode(max_wait=120):
     log.info(f"[startup] waiting for OpenCode at {OPENCODE_URL}...")
@@ -826,6 +1130,8 @@ def main():
     log.info("Clawith Bridge v2 starting")
     log.info(f"  Clawith:  {CLAWITH_API_URL}")
     log.info(f"  OpenCode: {OPENCODE_URL}")
+    log.info(f"  MAX_CONCURRENT_TASKS={MAX_CONCURRENT_TASKS}")
+    log.info(f"  BRIDGE_STATUS_PORT={STATUS_PORT}")
 
     if not wait_for_opencode():
         log.error("OpenCode server did not start in time")
@@ -836,6 +1142,9 @@ def main():
 
     # 从 OpenCode 恢复已有 session 缓存
     restore_sessions_from_opencode()
+
+    # 启动 Status HTTP server
+    start_status_server()
 
     # 启动 SSE 监听线程
     threading.Thread(target=sse_listener, daemon=True, name="sse").start()

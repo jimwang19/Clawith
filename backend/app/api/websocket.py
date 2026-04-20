@@ -121,6 +121,7 @@ async def call_llm(
     on_tool_call=None,
     on_thinking=None,
     supports_vision=False,
+    force_tool_name: str | None = None,
 ) -> str:
     """Call LLM via unified client with function-calling tool loop.
 
@@ -128,8 +129,12 @@ async def call_llm(
         on_chunk: Optional async callback(text: str) for streaming chunks to client.
         on_thinking: Optional async callback(text: str) for reasoning/thinking content.
         on_tool_call: Optional async callback(dict) for tool call status updates.
+        force_tool_name: If set, force the LLM to call this specific tool on the first
+            round (passes tool_choice={"type":"function","function":{"name":...}}).
+            Falls back to "auto" on subsequent rounds so the loop can continue normally.
     """
-    from app.services.agent_tools import AGENT_TOOLS, execute_tool, get_agent_tools_for_llm
+    from app.services.agent_tools import AGENT_TOOLS, get_agent_tools_for_llm
+    import app.services.agent_tools as _agent_tools_mod
     from app.services.llm_utils import create_llm_client, get_max_tokens, LLMMessage, LLMError
 
     # ── Token limit check & config ──
@@ -263,6 +268,14 @@ async def call_llm(
 
         try:
             # Use streaming API for real-time responses
+            _stream_kwargs: dict = {}
+            if force_tool_name and round_i == 0 and tools_for_llm:
+                # Force the specific tool on the first round only.
+                # Subsequent rounds use the default "auto" so the loop can proceed normally.
+                _stream_kwargs["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": force_tool_name},
+                }
             response = await client.stream(
                 messages=api_messages,
                 tools=tools_for_llm if tools_for_llm else None,
@@ -270,6 +283,7 @@ async def call_llm(
                 max_tokens=max_tokens,
                 on_chunk=on_chunk,
                 on_thinking=on_thinking,
+                **_stream_kwargs,
             )
         except LLMError as e:
             # Record accumulated tokens before returning error
@@ -361,7 +375,7 @@ async def call_llm(
                 except Exception:
                     pass
 
-            result = await execute_tool(
+            result = await _agent_tools_mod.execute_tool(
                 tool_name, args,
                 agent_id=agent_id,
                 user_id=user_id or agent_id,

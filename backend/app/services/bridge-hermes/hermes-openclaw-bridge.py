@@ -182,6 +182,15 @@ def _strip_banner(output: str) -> str:
             return response
 
     # 策略 2: 取 "Resume this session" 之前最后一段非框线文本
+    # Strip "Available Tools" / "Available Skills" startup banner (new hermes versions).
+    # The banner is a contiguous block ending at the first blank line after the last section.
+    output = re.sub(
+        r"[ \t]*Available (?:Tools|Skills).*?(?=\n\n|\Z)",
+        "",
+        output,
+        flags=re.DOTALL,
+    ).strip()
+
     resume_idx = output.find("Resume this session with:")
     chunk = output[:resume_idx].strip() if resume_idx > 0 else output.strip()
     chunk = re.sub(r"[\u2500-\u257f\u2580-\u259f]+", "", chunk)

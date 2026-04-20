@@ -303,7 +303,11 @@ async def _check_new_agent_messages(trigger: AgentTrigger) -> bool:
                 msg = result.scalar_one_or_none()
                 if not msg:
                     return False
-                cfg["_matched_message"] = (msg.content or "")[:2000]
+                content = (msg.content or "").strip()
+                # Skip startup banners (hermes TUI) — not business messages
+                if not content or "Available Tools" in content or "Available Skills" in content:
+                    return False
+                cfg["_matched_message"] = content[:2000]
                 cfg["_matched_from"] = from_agent_name
                 return True
 

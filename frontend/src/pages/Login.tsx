@@ -436,14 +436,14 @@ export default function Login() {
 
                     <form onSubmit={handleSubmit} className="login-form">
                         <div className="login-field">
-                            <label>{t('auth.email')}</label>
+                            <label>{t('auth.loginIdentifier')}</label>
                             <input
-                                type="email"
+                                type="text"
                                 value={form.login_identifier}
                                 onChange={(e) => setForm({ ...form, login_identifier: e.target.value })}
                                 required
                                 autoFocus
-                                placeholder={t('auth.emailPlaceholder')}
+                                placeholder={t('auth.loginIdentifierPlaceholder')}
                             />
                         </div>
 

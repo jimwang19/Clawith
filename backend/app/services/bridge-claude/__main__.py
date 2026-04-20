@@ -66,7 +66,7 @@ log = logging.getLogger("bridge-claude")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-CLAWITH_API_URL          = os.environ.get("CLAWITH_API_URL",          "http://100.123.217.100:8000")
+CLAWITH_API_URL          = os.environ.get("CLAWITH_API_URL",          "http://127.0.0.1:8000")
 CLAWITH_API_KEY          = os.environ.get("CLAWITH_API_KEY",          "")
 POLL_INTERVAL            = int(os.environ.get("POLL_INTERVAL",        "5"))
 TASK_TIMEOUT             = int(os.environ.get("TASK_TIMEOUT",     "300"))
@@ -125,6 +125,31 @@ def _short_text(text: str, limit: int = 120) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "..."
+
+
+def _looks_like_non_task_echo(text: str) -> bool:
+    """Heuristic filter for non-actionable loop chatter from peer agents."""
+    s = (text or "").strip().lower()
+    if not s:
+        return True
+
+    markers = (
+        "no task",
+        "standing by",
+        "deadlock",
+        "echo loop",
+        "absolute silence",
+        "no response",
+        "real task",
+        "waiting for",
+        "staying silent",
+    )
+    if any(m in s for m in markers):
+        return True
+
+    # Placeholder-only payloads like "..." or "***" are non-task inputs.
+    compact = s.replace(".", "").replace("*", "").replace("-", "").strip()
+    return compact == ""
 
 
 def _monitor_inc(key: str, delta: int = 1):
@@ -877,6 +902,15 @@ def process_message(msg: dict):
     sender_agent = msg.get("sender_agent_name") or ""
     if sender_agent.lower() == SELF_AGENT_NAME.lower():
         log.debug(f"[msg] drop self-echo id={str(msg_id)[:8]} sender='{sender_agent}'")
+        return
+
+    # Drop non-task chatter from other agents to avoid echo/deadlock loops
+    # continuously occupying the same conversation slot.
+    if sender_agent and _looks_like_non_task_echo(content):
+        log.info(
+            f"[msg] drop non-task echo id={str(msg_id)[:8]} "
+            f"sender='{sender_agent}' text='{_short_text(content)}'"
+        )
         return
 
     # Check if this is a permission reply

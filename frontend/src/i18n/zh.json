@@ -86,6 +86,8 @@
     "usernamePlaceholder": "请输入用户名",
     "passwordPlaceholder": "请输入密码",
     "emailPlaceholder": "your@email.com",
+    "loginIdentifier": "用户名 / 邮箱",
+    "loginIdentifierPlaceholder": "用户名或邮箱",
     "forgotPassword": "忘记密码？",
     "forgotPasswordTitle": "忘记密码",
     "forgotPasswordSubtitle": "输入你的账号邮箱；如果该账号存在，系统会发送一封重置链接邮件。",
